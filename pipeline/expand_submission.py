@@ -135,8 +135,9 @@ def expand(slug: str, build_dir=None) -> dict:
         "end_card_question": sub.get("end_card_question") or texts[-1],
         "optimization_target": "belief_analysis",
         "target_duration_seconds": round(len(narration.split()) / 2.1, 1),
-        # Every video ships as long-form AND a vertical Short by default.
-        "render_outputs": sub.get("render_outputs") or ["youtube", "portrait"],
+        # Long-form only by default. Shorts are paused; a submission can still
+        # opt in explicitly with "render_outputs": ["youtube", "portrait"].
+        "render_outputs": sub.get("render_outputs") or ["youtube"],
         "script_origin": "think_tank_submission",
         "supplied_script": True, "source_script_verbatim": True,
         "source_script_filename": "source-script.txt",

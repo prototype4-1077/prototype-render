@@ -58,9 +58,9 @@ That is the **entire** submission. A workflow automatically:
 
 You do **not** need to write `script.json`, `source-script.txt`, or `render.request` yourself.
 
-**Every video ships twice.** Each render produces a landscape long-form *and* a
-vertical Short, and publishing posts both — each with its own generated
-thumbnail. You do not request this; it is the default.
+**Long-form only (Shorts paused).** Each render produces the landscape master
+and publishing posts it with a generated thumbnail. Vertical Shorts are paused;
+a submission can still opt in with `"render_outputs": ["youtube", "portrait"]`.
 
 ### Fields
 | field | required | notes |

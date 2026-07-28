@@ -238,9 +238,11 @@ def publish(slugs: list[str], *, force: bool = False) -> dict[str, dict[str, Any
         print(f"PUBLISHED {slug} -> {record['url']}", flush=True)
         set_thumbnail(video_id, slug, token, meta)
 
-        # Standing rule: every video also ships as a vertical Short.
+        # Shorts are PAUSED. Auto-posting only happens when a queue entry for
+        # "<slug>-short" exists explicitly; nothing is generated automatically.
         short_slug = f"{slug}-short"
         if (not slug.endswith("-short") and short_slug not in history
+                and short_slug in queue
                 and release_has_portrait(slug)):
             try:
                 smeta = queue.get(short_slug) or short_meta(slug, meta)
