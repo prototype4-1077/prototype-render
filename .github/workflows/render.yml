@@ -37,6 +37,9 @@ on:
         required: false
         default: false
 
+env:
+  CONTENT_REPO: prototype4-1077/Prototype-Video
+
 permissions:
   contents: write
 
@@ -51,6 +54,27 @@ jobs:
     container: ${{ inputs.use_container && 'ghcr.io/1974jwatson/tiktok-render:latest' || '' }}
     steps:
       - uses: actions/checkout@v4
+
+      - name: Fetch private content (build package, memory, concept engine)
+        uses: actions/checkout@v4
+        with:
+          repository: prototype4-1077/Prototype-Video
+          token: ${{ secrets.CONTENT_PAT }}
+          path: _content
+          fetch-depth: 1
+
+      - name: Stage private content into the working tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          cp -r "_content/build/${{ inputs.slug }}" "build/${{ inputs.slug }}"
+          for f in memory.json feedback_rule_candidates.json editorial_memory.json                    published_videos.json yt_publish_queue.json yt_published_result.json                    fb_publish_queue.json fb_published_result.json                    stock_supply_report.json youtube_stats_status.json; do
+            [ -f "_content/pipeline/$f" ] && cp "_content/pipeline/$f" "pipeline/$f" || true
+          done
+          [ -d _content/concept ] && cp -r _content/concept . || true
+          [ -d _content/intelligence_stack ] && cp -r _content/intelligence_stack . || true
+          echo "staged $(du -sh build/${{ inputs.slug }} | cut -f1) for ${{ inputs.slug }}"
 
       - name: Verify exact preflighted package
         shell: bash
@@ -311,59 +335,36 @@ jobs:
           test -f "build/${{ inputs.slug }}/scene-review.json" && gh release upload "$TAG" \
             "build/${{ inputs.slug }}/scene-review.json#${{ inputs.slug }}-scene-review.json" --clobber || true
 
-      - name: Commit outcome, memory, and compact Governor telemetry
+      - name: Commit outcome, memory, and telemetry to the private content repo
         if: always()
         shell: bash
         run: |
+          set -euo pipefail
           rm -f pipeline/.env
           printf '%s\n' "${{ github.run_id }}" > "build/${{ inputs.slug }}/run-id.txt"
+          # copy results back into the private checkout
+          mkdir -p "_content/build/${{ inputs.slug }}"
+          for f in script.json run-id.txt alts.json governor-summary.json governor-review.json \
+                   render-status.json quality_report.json narrative_fidelity_report.json \
+                   scene-review.json package-status.json; do
+            [ -f "build/${{ inputs.slug }}/$f" ] && cp "build/${{ inputs.slug }}/$f" "_content/build/${{ inputs.slug }}/$f" || true
+          done
+          cp build/${{ inputs.slug }}/emb_*.npy "_content/build/${{ inputs.slug }}/" 2>/dev/null || true
+          # merge shared learning memory rather than overwriting a concurrent render's
+          if [ -f pipeline/memory.json ]; then
+            python3 pipeline/merge_memory.py \
+              "_content/pipeline/memory.json" "pipeline/memory.json" "_content/pipeline/memory.json" \
+              "_content/pipeline/memory.json" || cp pipeline/memory.json "_content/pipeline/memory.json"
+          fi
+          cd _content
           git config user.name "render-bot"
           git config user.email "render@users.noreply.github.com"
-          for f in \
-            pipeline/memory.json \
-            "build/${{ inputs.slug }}/script.json" \
-            "build/${{ inputs.slug }}/run-id.txt" \
-            "build/${{ inputs.slug }}/alts.json" \
-            "build/${{ inputs.slug }}/governor-summary.json" \
-            "build/${{ inputs.slug }}/governor-review.json" \
-            "build/${{ inputs.slug }}/render-status.json" \
-            "build/${{ inputs.slug }}/quality_report.json" \
-            "build/${{ inputs.slug }}/narrative_fidelity_report.json" \
-            "build/${{ inputs.slug }}/scene-review.json" \
-            "build/${{ inputs.slug }}"/emb_*.npy; do
-            git add "$f" 2>/dev/null || true
-          done
-          # capture the pre-render memory as the merge base BEFORE committing
-          MEMBASE=$(mktemp)
-          git show HEAD:pipeline/memory.json > "$MEMBASE" 2>/dev/null || echo '{}' > "$MEMBASE"
-          git commit -m "render ${{ inputs.slug }}: persist outcome and governor telemetry" || echo "nothing to commit"
-          # conflict-proof retry: snapshot our outcome files, replay them on fresh remote tip
-          SNAP=$(mktemp -d)
-          git show --pretty= --name-only HEAD | while read -r f; do
-            [ -f "$f" ] && mkdir -p "$SNAP/$(dirname "$f")" && cp "$f" "$SNAP/$f" || true
-          done
+          git add -A "build/${{ inputs.slug }}" pipeline/memory.json 2>/dev/null || true
+          git commit -m "render ${{ inputs.slug }}: persist outcome and telemetry" || { echo "nothing to commit"; exit 0; }
           for i in 1 2 3 4 5; do
             git push && exit 0
-            git fetch origin main
-            git reset --hard origin/main
-            (cd "$SNAP" && find . -type f | while read -r f; do
-              mkdir -p "$GITHUB_WORKSPACE/$(dirname "$f")" && cp "$f" "$GITHUB_WORKSPACE/$f"
-            done)
-            # pipeline/memory.json is SHARED across concurrent renders. Replaying our
-            # snapshot wholesale would erase whatever the other render just learned,
-            # so three-way merge it against the tip we just reset onto instead.
-            if [ -f "$SNAP/pipeline/memory.json" ]; then
-              git show origin/main:pipeline/memory.json > /tmp/memory.theirs.json 2>/dev/null || echo '{}' > /tmp/memory.theirs.json
-              python3 pipeline/merge_memory.py \
-                "$MEMBASE" "$SNAP/pipeline/memory.json" /tmp/memory.theirs.json \
-                pipeline/memory.json \
-                || cp "$SNAP/pipeline/memory.json" pipeline/memory.json
-            fi
-            (cd "$SNAP" && find . -type f | sed 's|^\./||') | while read -r f; do
-              git add "$f" || true
-            done
-            git commit -m "render ${{ inputs.slug }}: persist outcome and governor telemetry" || echo "nothing to commit"
+            git fetch origin main && git pull --rebase --autostash origin main || { git rebase --abort || true; }
             sleep $((i * 2))
           done
-          echo "unable to push render outcome after 5 attempts" >&2
+          echo "render succeeded but telemetry could not be persisted" >&2
           exit 1
