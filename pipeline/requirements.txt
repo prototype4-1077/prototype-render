@@ -1,0 +1,15 @@
+--extra-index-url https://download.pytorch.org/whl/cpu
+numpy
+Pillow
+fonttools
+torch
+torchvision
+open_clip_torch
+faster-whisper
+opencv-python-headless
+onnxruntime
+opentimelineio==0.18.1
+scenedetect-headless==0.7.1
+opentelemetry-api==1.44.0
+opentelemetry-sdk==1.44.0
+opentelemetry-exporter-otlp-proto-http==1.44.0

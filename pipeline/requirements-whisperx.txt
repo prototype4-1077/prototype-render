@@ -1,0 +1,3 @@
+# Shadow benchmark only. Do not add this to pipeline/requirements.txt.
+# Stable release pinned because word-level timing behavior has changed across releases.
+whisperx==3.8.6
