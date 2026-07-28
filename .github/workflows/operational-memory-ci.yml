@@ -1,0 +1,220 @@
+name: Operational memory and system hardening integrity
+
+on:
+  pull_request:
+    paths:
+      - "pipeline/operational_memory.py"
+      - "pipeline/operational_memory_analysis.py"
+      - "pipeline/record_operational_run.py"
+      - "pipeline/package_integrity.py"
+      - "pipeline/backfill_observability.py"
+      - "pipeline/feedback_rule_candidates.py"
+      - "pipeline/stock_supply_analysis.py"
+      - "pipeline/yt_stats_refresh.py"
+      - "pipeline/system_diagnostics.py"
+      - "pipeline/system_diagnostic_policy.py"
+      - "pipeline/user_script_intake.py"
+      - "pipeline/preflight.py"
+      - "pipeline/yt_publish.py"
+      - "pipeline/fb_publish.py"
+      - "pipeline/operational_memory/**"
+      - "pipeline/tests/test_operational_memory.py"
+      - "pipeline/tests/test_system_hardening.py"
+      - "pipeline/tests/test_diagnostic_policy.py"
+      - "pipeline/tests/test_learning_evidence.py"
+      - "pipeline/tests/test_user_script_intake.py"
+      - "intelligence_stack/fiftyone/analyze_visual_memory.py"
+      - ".github/workflows/render-request.yml"
+      - ".github/workflows/render.yml"
+      - ".github/workflows/user-script-intake.yml"
+      - ".github/workflows/visual-memory.yml"
+      - ".github/workflows/youtube_publish.yml"
+      - ".github/workflows/facebook_publish.yml"
+      - ".github/workflows/youtube-stats.yml"
+      - ".github/workflows/system-diagnostics.yml"
+      - ".github/workflows/operational-memory-*.yml"
+  push:
+    branches: [main]
+    paths:
+      - "pipeline/operational_memory.py"
+      - "pipeline/operational_memory_analysis.py"
+      - "pipeline/record_operational_run.py"
+      - "pipeline/package_integrity.py"
+      - "pipeline/backfill_observability.py"
+      - "pipeline/feedback_rule_candidates.py"
+      - "pipeline/stock_supply_analysis.py"
+      - "pipeline/yt_stats_refresh.py"
+      - "pipeline/system_diagnostics.py"
+      - "pipeline/system_diagnostic_policy.py"
+      - "pipeline/user_script_intake.py"
+      - "pipeline/preflight.py"
+      - "pipeline/yt_publish.py"
+      - "pipeline/fb_publish.py"
+      - "pipeline/operational_memory/**"
+      - "pipeline/tests/test_operational_memory.py"
+      - "pipeline/tests/test_system_hardening.py"
+      - "pipeline/tests/test_diagnostic_policy.py"
+      - "pipeline/tests/test_learning_evidence.py"
+      - "pipeline/tests/test_user_script_intake.py"
+      - "intelligence_stack/fiftyone/analyze_visual_memory.py"
+      - ".github/workflows/render-request.yml"
+      - ".github/workflows/render.yml"
+      - ".github/workflows/user-script-intake.yml"
+      - ".github/workflows/visual-memory.yml"
+      - ".github/workflows/youtube_publish.yml"
+      - ".github/workflows/facebook_publish.yml"
+      - ".github/workflows/youtube-stats.yml"
+      - ".github/workflows/system-diagnostics.yml"
+      - ".github/workflows/operational-memory-*.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install lightweight validation dependency
+        run: python3 -m pip install --quiet PyYAML
+
+      - name: Compile and validate catalogs
+        run: |
+          python3 -m py_compile \
+            pipeline/operational_memory.py \
+            pipeline/operational_memory_analysis.py \
+            pipeline/record_operational_run.py \
+            pipeline/package_integrity.py \
+            pipeline/backfill_observability.py \
+            pipeline/feedback_rule_candidates.py \
+            pipeline/stock_supply_analysis.py \
+            pipeline/yt_stats_refresh.py \
+            pipeline/system_diagnostics.py \
+            pipeline/system_diagnostic_policy.py \
+            pipeline/user_script_intake.py \
+            pipeline/preflight.py \
+            pipeline/yt_publish.py \
+            pipeline/fb_publish.py \
+            intelligence_stack/fiftyone/analyze_visual_memory.py
+          python3 - <<'PY'
+          import json
+          import yaml
+          for path in (
+              "pipeline/operational_memory/solutions.json",
+              "pipeline/operational_memory/prevention_rules.json",
+              "pipeline/operational_memory/incidents.json",
+              "pipeline/operational_memory/index.json",
+          ):
+              json.load(open(path, encoding="utf-8"))
+              print("valid", path)
+          for path in (
+              ".github/workflows/render-request.yml",
+              ".github/workflows/render.yml",
+              ".github/workflows/user-script-intake.yml",
+              ".github/workflows/visual-memory.yml",
+              ".github/workflows/youtube_publish.yml",
+              ".github/workflows/facebook_publish.yml",
+              ".github/workflows/youtube-stats.yml",
+              ".github/workflows/system-diagnostics.yml",
+              ".github/workflows/operational-memory-capture.yml",
+              ".github/workflows/operational-memory-materialize.yml",
+          ):
+              yaml.safe_load(open(path, encoding="utf-8"))
+              print("valid yaml", path)
+          PY
+
+      - name: Run operational and system hardening tests
+        run: |
+          python3 -m unittest pipeline.tests.test_operational_memory -v
+          python3 -m unittest pipeline.tests.test_system_hardening -v
+          python3 -m unittest pipeline.tests.test_diagnostic_policy -v
+          python3 -m unittest pipeline.tests.test_learning_evidence -v
+          python3 -m unittest pipeline.tests.test_user_script_intake -v
+
+      - name: Rebuild causal index and validate materialized evidence
+        run: |
+          python3 pipeline/operational_memory_analysis.py
+          python3 - <<'PY'
+          import json
+          index = json.load(open("pipeline/operational_memory/index.json", encoding="utf-8"))
+          actions = json.load(open("pipeline/operational_memory/action_queue.json", encoding="utf-8"))
+          assert index["occurrence_count"] >= 8
+          assert index["solution_count"] >= 7
+          assert "solution_evidence" in index
+          assert "warning_counts" in index
+          assert "advisory_counts" in index
+          assert "actions" in actions
+          print("indexed", index["occurrence_count"], "occurrences and", len(actions["actions"]), "actions")
+          PY
+
+      - name: Exercise calibrated diagnostic against repository evidence
+        shell: bash
+        run: |
+          set -o pipefail
+          mkdir -p /tmp/system-diagnostic-debug
+          python3 intelligence_stack/fiftyone/analyze_visual_memory.py \
+            > /tmp/system-diagnostic-debug/visual.stdout.txt \
+            2> /tmp/system-diagnostic-debug/visual.stderr.txt
+          python3 pipeline/backfill_observability.py \
+            > /tmp/system-diagnostic-debug/backfill.stdout.txt \
+            2> /tmp/system-diagnostic-debug/backfill.stderr.txt
+          python3 pipeline/feedback_rule_candidates.py \
+            > /tmp/system-diagnostic-debug/feedback.stdout.txt \
+            2> /tmp/system-diagnostic-debug/feedback.stderr.txt
+          python3 pipeline/stock_supply_analysis.py \
+            > /tmp/system-diagnostic-debug/stock.stdout.txt \
+            2> /tmp/system-diagnostic-debug/stock.stderr.txt
+          python3 pipeline/system_diagnostic_policy.py \
+            > /tmp/system-diagnostic-debug/system.stdout.txt \
+            2> /tmp/system-diagnostic-debug/system.stderr.txt
+          python3 - <<'PY' \
+            > /tmp/system-diagnostic-debug/validation.stdout.txt \
+            2> /tmp/system-diagnostic-debug/validation.stderr.txt
+          import json
+          report = json.load(open("pipeline/system_diagnostics/LATEST.json", encoding="utf-8"))
+          feedback = json.load(open("pipeline/feedback_rule_candidates.json", encoding="utf-8"))
+          stock = json.load(open("pipeline/stock_supply_report.json", encoding="utf-8"))
+          assert report["authority_boundary"]
+          assert report["denominator_policy"]
+          assert report["summary"]["finding_count"] == len(report["findings"])
+          coverage = report["coverage"]
+          assert coverage["render_observed_count"] >= coverage["telemetry_count"]
+          assert coverage["reviewable_count"] >= coverage["human_feedback_count"]
+          assert coverage["youtube_published_receipt_count"] >= coverage["youtube_stats_count"]
+          assert feedback["authority_boundary"]
+          assert stock["measurement_boundary"]
+          print("diagnostic", report["summary"])
+          print("coverage", coverage)
+          print("feedback", feedback["candidate_count"])
+          print("stock", stock["state"], stock["evidence_strength"])
+          PY
+
+      - name: Validate user-script authority boundary
+        run: |
+          grep -q 'source_script_lock' .github/workflows/render-request.yml
+          grep -q 'test ! -f "build/$slug/render.request"' .github/workflows/user-script-intake.yml
+          grep -q 'never starts a render' pipeline/USER_SCRIPT_INTAKE.md
+
+      - name: Upload diagnostic traceback and materialized reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: system-hardening-debug-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            /tmp/system-diagnostic-debug/**
+            concept/visual_memory/action_report.json
+            pipeline/system_diagnostics/**
+            pipeline/feedback_rule_candidates.json
+            pipeline/stock_supply_report.json
+            pipeline/youtube_stats_status.json
+            pipeline/operational_memory/action_queue.json
+            pipeline/operational_memory/index.json
+            build/*/telemetry-summary.json

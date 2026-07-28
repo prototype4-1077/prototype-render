@@ -1,0 +1,120 @@
+name: Storyline Match Regression
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - pipeline/editorial_memory.json
+      - pipeline/narrative_fidelity.py
+      - pipeline/storyboard.py
+      - pipeline/storyline_footage.py
+      - pipeline/governed_build.py
+      - pipeline/tests/test_storyline_match.py
+      - pipeline/STORYLINE_MATCH.md
+      - .github/workflows/test-storyline-match.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: storyline-match-regression
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: System dependencies
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+
+      - name: Python dependencies
+        run: pip install -q -r pipeline/requirements.txt
+
+      - name: Compile narrative modules
+        run: |
+          python3 -m py_compile \
+            pipeline/narrative_fidelity.py \
+            pipeline/storyboard.py \
+            pipeline/storyline_footage.py \
+            pipeline/governed_build.py
+
+      - name: Full pipeline regression suite
+        run: python3 -m unittest discover -s pipeline/tests -v
+
+      - name: Literal storyboard smoke render
+        env:
+          PYTHONPATH: pipeline
+        run: |
+          python3 - <<'PY'
+          import json
+          import tempfile
+          from pathlib import Path
+
+          import motion
+          import storyboard
+
+          with tempfile.TemporaryDirectory() as directory:
+              build = Path(directory)
+              script = {
+                  "title": "Storyline Match Smoke Test",
+                  "slug": "storyline-match-smoke",
+                  "scenes": [{
+                      "text": "This is success. This is failure. This is normal. This is impossible.",
+                      "query": "four physical rubber stamps mark papers success failure normal impossible",
+                      "keywords": ["success", "failure", "normal", "impossible"],
+                      "semantic_anchor": "cultural labels define the acceptable world",
+                      "visual_function": "contrast",
+                      "symbol_family": "language",
+                      "duration": 1.0,
+                  }],
+              }
+              result = storyboard.render_scene(str(build), script, 0)
+              output = build / result["output"]
+              evidence = motion.temporal_evidence(str(output))
+              assert output.stat().st_size > 100_000, output.stat().st_size
+              assert evidence["passes"], evidence
+              assert script["scenes"][0]["motion_source"] == "literal_storyboard"
+              print(json.dumps({
+                  "bytes": output.stat().st_size,
+                  "motion_evidence": evidence,
+              }, indent=2))
+          PY
+
+      - name: Record regression result
+        if: ${{ always() }}
+        env:
+          RESULT: ${{ job.status }}
+          RUN_ID: ${{ github.run_id }}
+          HEAD_SHA: ${{ github.sha }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path("pipeline/storyline-match-ci.json").write_text(
+              json.dumps({
+                  "schema_version": 1,
+                  "result": os.environ["RESULT"],
+                  "run_id": os.environ["RUN_ID"],
+                  "head_sha": os.environ["HEAD_SHA"],
+              }, indent=2) + "\n",
+              encoding="utf-8",
+          )
+          PY
+          git config user.name storyline-match-ci
+          git config user.email storyline-match-ci@users.noreply.github.com
+          git add pipeline/storyline-match-ci.json
+          git commit -m "ci: record storyline-match ${RESULT}" || exit 0
+          git pull --rebase origin main || git rebase --abort || true
+          git push || true

@@ -1,0 +1,148 @@
+name: Editorial revision integrity
+
+on:
+  pull_request:
+    paths:
+      - "pipeline/editorial_*.py"
+      - "pipeline/revision_cache.py"
+      - "pipeline/selective_revision.py"
+      - "pipeline/export_verify.py"
+      - "pipeline/locked_audio.py"
+      - "pipeline/tests/test_editorial_revision.py"
+      - "pipeline/requirements.txt"
+      - ".github/workflows/editorial-*.yml"
+      - ".github/workflows/selective-revision.yml"
+      - ".github/workflows/apply-scene-feedback.yml"
+  push:
+    branches: [main]
+    paths:
+      - "pipeline/editorial_*.py"
+      - "pipeline/revision_cache.py"
+      - "pipeline/selective_revision.py"
+      - "pipeline/export_verify.py"
+      - "pipeline/locked_audio.py"
+      - "pipeline/tests/test_editorial_revision.py"
+      - "pipeline/requirements.txt"
+      - ".github/workflows/editorial-*.yml"
+      - ".github/workflows/selective-revision.yml"
+      - ".github/workflows/apply-scene-feedback.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install focused editorial dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ffmpeg
+          pip install -q opentimelineio==0.18.1 scenedetect-headless==0.7.1
+
+      - name: Compile and run unit tests
+        run: |
+          python3 -m py_compile \
+            pipeline/editorial_timeline.py \
+            pipeline/editorial_cache_build.py \
+            pipeline/revision_cache.py \
+            pipeline/selective_revision.py \
+            pipeline/export_verify.py \
+            pipeline/locked_audio.py
+          python3 -m unittest pipeline.tests.test_editorial_revision -v
+
+      - name: Exercise OTIO, cache, selective replacement, exact audio, and scene detection
+        shell: bash
+        run: |
+          set -euo pipefail
+          build=/tmp/editorial-e2e
+          mkdir -p "$build"
+          cat > "$build/script.json" <<'JSON'
+          {
+            "title": "Editorial Test",
+            "slug": "editorial-test",
+            "scenes": [
+              {"text": "First scene.", "start": 0.0, "duration": 1.0},
+              {"text": "Second scene.", "start": 1.0, "duration": 1.0},
+              {"text": "Third scene?", "start": 2.0, "duration": 1.0}
+            ]
+          }
+          JSON
+          for index in 0 1 2; do
+            hue=$((index * 90))
+            ffmpeg -v error -y -f lavfi \
+              -i "testsrc2=size=640x360:rate=30:duration=1, hue=h=$hue" \
+              -c:v libx264 -preset ultrafast -crf 0 -pix_fmt yuv420p \
+              "$build/youtube_seg_0${index}.mp4"
+            cp "$build/youtube_seg_0${index}.mp4" "$build/clip_0${index}.mp4"
+          done
+          printf "file '%s'\n" \
+            "$build/youtube_seg_00.mp4" \
+            "$build/youtube_seg_01.mp4" \
+            "$build/youtube_seg_02.mp4" > "$build/list.txt"
+          ffmpeg -v error -y -f concat -safe 0 -i "$build/list.txt" -c copy "$build/noaudio.mp4"
+          ffmpeg -v error -y -i "$build/noaudio.mp4" \
+            -f lavfi -i "sine=frequency=220:sample_rate=48000:duration=3" \
+            -map 0:v -map 1:a -c:v copy -c:a aac -shortest "$build/final_youtube.mp4"
+          python3 pipeline/locked_audio.py extract "$build/final_youtube.mp4" "$build"
+          original_audio_md5="$(python3 - "$build/locked-audio-manifest.json" <<'PY'
+          import json, sys
+          print(json.load(open(sys.argv[1]))["locked_audio_stream_md5"])
+          PY
+          )"
+
+          python3 pipeline/editorial_timeline.py build "$build"
+          python3 pipeline/editorial_timeline.py verify "$build"
+          python3 pipeline/export_verify.py "$build" final_youtube.mp4 --frames
+          python3 pipeline/revision_cache.py build "$build" --run-id synthetic
+          cat > "$build/scene-feedback.request.json" <<'JSON'
+          {
+            "slug": "editorial-test",
+            "scenes": [
+              {"scene_index": 0, "decision": "approved", "comments": "keep"},
+              {"scene_index": 1, "decision": "revise", "comments": "replace"},
+              {"scene_index": 2, "decision": "approved", "comments": "keep"}
+            ],
+            "overall": {"decision": "revise"}
+          }
+          JSON
+          python3 pipeline/selective_revision.py prepare "$build"
+          approved_zero_before="$(sha256sum "$build/youtube_seg_00.mp4" | cut -d' ' -f1)"
+          approved_two_before="$(sha256sum "$build/youtube_seg_02.mp4" | cut -d' ' -f1)"
+          test ! -e "$build/youtube_seg_01.mp4"
+
+          ffmpeg -v error -y -f lavfi \
+            -i "smptebars=size=640x360:rate=30:duration=1" \
+            -c:v libx264 -preset ultrafast -crf 0 -pix_fmt yuv420p \
+            "$build/youtube_seg_01.mp4"
+          cp "$build/youtube_seg_01.mp4" "$build/clip_01.mp4"
+          printf "file '%s'\n" \
+            "$build/youtube_seg_00.mp4" \
+            "$build/youtube_seg_01.mp4" \
+            "$build/youtube_seg_02.mp4" > "$build/list.txt"
+          ffmpeg -v error -y -f concat -safe 0 -i "$build/list.txt" -c copy "$build/noaudio.mp4"
+          ffmpeg -v error -y -i "$build/noaudio.mp4" \
+            -f lavfi -i "sine=frequency=880:sample_rate=48000:duration=3" \
+            -map 0:v -map 1:a -c:v copy -c:a aac -shortest "$build/final_youtube.mp4"
+          python3 pipeline/locked_audio.py apply "$build/final_youtube.mp4" "$build" \
+            | tee "$build/locked-apply.json"
+          grep -q '"exact_audio_match": true' "$build/locked-apply.json"
+          test "$approved_zero_before" = "$(sha256sum "$build/youtube_seg_00.mp4" | cut -d' ' -f1)"
+          test "$approved_two_before" = "$(sha256sum "$build/youtube_seg_02.mp4" | cut -d' ' -f1)"
+          test "$original_audio_md5" = "$(python3 - "$build/locked-apply.json" <<'PY'
+          import json, sys
+          print(json.load(open(sys.argv[1]))["video_audio_stream_md5"])
+          PY
+          )"
+          python3 pipeline/selective_revision.py finalize "$build"
+          python3 pipeline/editorial_timeline.py build "$build"
+          python3 pipeline/editorial_timeline.py verify "$build"
+          python3 pipeline/export_verify.py "$build" final_youtube.mp4

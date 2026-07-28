@@ -1,0 +1,299 @@
+name: Render stock-slide video
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "build/**/stockslides.request"
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      slug: ${{ steps.slug.outputs.slug }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: slug
+        shell: bash
+        run: |
+          file="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -E '^build/[^/]+/stockslides\.request$' | head -n 1)"
+          test -n "$file"
+          slug="${file#build/}"
+          slug="${slug%/stockslides.request}"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+
+  render:
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: stock-slides-${{ needs.detect.outputs.slug }}
+      cancel-in-progress: false
+    env:
+      SLUG: ${{ needs.detect.outputs.slug }}
+      BD: build/${{ needs.detect.outputs.slug }}
+      PYTHONUNBUFFERED: "1"
+      WHISPER_MODEL: base
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore and verify the exact attached Liam voice
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+
+          bd = pathlib.Path(os.environ["BD"])
+          script = json.loads((bd / "script.json").read_text(encoding="utf-8"))
+          expected = script["voice_source"]
+          source = pathlib.Path("build") / expected["source_build"]
+          pattern = re.compile(r"vo\.mp3\.b64\.part\d{3}$")
+          parts = sorted(path for path in source.glob("vo.mp3.b64.part*") if pattern.search(path.name))
+          if len(parts) != 13:
+              raise SystemExit(f"expected 13 exact voice parts; found {len(parts)}: {[p.name for p in parts]}")
+          raw = b"".join(
+              base64.b64decode(path.read_text(encoding="ascii").strip(), validate=True)
+              for path in parts
+          )
+          digest = hashlib.sha256(raw).hexdigest()
+          if len(raw) != int(expected["bytes"]):
+              raise SystemExit(f"voice byte mismatch: {len(raw)} != {expected['bytes']}")
+          if digest != expected["sha256"]:
+              raise SystemExit(f"voice checksum mismatch: {digest}")
+          target = bd / "vo.mp3"
+          target.write_bytes(raw)
+          print(f"exact voice restored: {len(raw)} bytes sha256={digest}")
+          PY
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cache transcription models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            /tmp/models
+          key: stock-slides-models-v1
+
+      - name: System dependencies
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+
+      - name: Python dependencies
+        run: pip install -q -r pipeline/requirements.txt
+
+      - name: Validate voice, fonts, and pipeline tests
+        shell: bash
+        run: |
+          duration="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$BD/vo.mp3")"
+          python3 - "$duration" <<'PY'
+          import json, os, pathlib, sys
+          actual = float(sys.argv[1])
+          script = json.loads((pathlib.Path(os.environ["BD"]) / "script.json").read_text(encoding="utf-8"))
+          expected = float(script["voice_source"]["duration_seconds"])
+          if abs(actual - expected) > 0.08:
+              raise SystemExit(f"voice duration mismatch: {actual:.3f}s vs {expected:.3f}s")
+          print(f"exact voice verified: {actual:.3f}s")
+          PY
+          python3 -c 'import sys; sys.path.insert(0,"pipeline"); import build; build.ensure_fonts()'
+          python3 -m unittest discover -s pipeline/tests -v
+
+      - name: Word-sync and align the narration
+        shell: bash
+        run: |
+          rm -f "$BD/words.json"
+          python3 pipeline/transcribe.py "$BD"
+          python3 - <<'PY'
+          import json, os, pathlib
+          path = pathlib.Path(os.environ["BD"]) / "script.json"
+          script = json.loads(path.read_text(encoding="utf-8"))
+          for scene in script["scenes"]:
+              for key in ("start", "duration", "kw_times", "kw_overlays", "youtube_kw_overlays"):
+                  scene.pop(key, None)
+          path.write_text(json.dumps(script, indent=1, ensure_ascii=False), encoding="utf-8")
+          PY
+          python3 pipeline/align.py "$BD"
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          bd = pathlib.Path(os.environ["BD"])
+          path = bd / "script.json"
+          script = json.loads(path.read_text(encoding="utf-8"))
+          duration = float(subprocess.check_output([
+              "ffprobe", "-v", "error", "-show_entries", "format=duration",
+              "-of", "csv=p=0", str(bd / "vo.mp3")
+          ], text=True).strip())
+          last = script["scenes"][-1]
+          last["duration"] = round(max(duration - float(last["start"]), 1.0), 3)
+          script["voiceover"] = "vo.mp3"
+          path.write_text(json.dumps(script, indent=1, ensure_ascii=False), encoding="utf-8")
+          print(f"timeline clamped to exact voice: {duration:.3f}s")
+          PY
+
+      - name: Curate and render photographic stock slides
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+        run: |
+          python3 pipeline/stock_slides.py "$BD" render-all
+          python3 pipeline/stock_slides.py "$BD" audit
+
+      - name: Generate captions and Social Weather title without music
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          sys.path.insert(0, "pipeline")
+          from captions import caption_png, title_png, youtube_caption_png, youtube_title_png
+          bd = pathlib.Path(os.environ["BD"])
+          path = bd / "script.json"
+          script = json.loads(path.read_text(encoding="utf-8"))
+          for index, scene in enumerate(script["scenes"]):
+              if scene.get("kw_times"):
+                  ovs = caption_png(scene["text"], scene.get("keywords", []), str(bd / f"cap_{index:02d}.png"), kw_overlay_prefix=str(bd / f"cap_{index:02d}_kw"))
+                  scene["kw_overlays"] = [{"kw": kw, "png": pathlib.Path(png).name} for kw, png in ovs]
+                  yt = youtube_caption_png(scene["text"], scene.get("keywords", []), str(bd / f"youtube_cap_{index:02d}.png"), kw_overlay_prefix=str(bd / f"youtube_cap_{index:02d}_kw"))
+                  scene["youtube_kw_overlays"] = [{"kw": kw, "png": pathlib.Path(png).name} for kw, png in yt]
+              else:
+                  caption_png(scene["text"], scene.get("keywords", []), str(bd / f"cap_{index:02d}.png"))
+                  youtube_caption_png(scene["text"], scene.get("keywords", []), str(bd / f"youtube_cap_{index:02d}.png"))
+          eyebrow = script.get("title_eyebrow") or script.get("series_label")
+          title_png(script["title"], str(bd / "title.png"), eyebrow=eyebrow)
+          youtube_title_png(script["title"], str(bd / "youtube_title.png"), eyebrow=eyebrow)
+          path.write_text(json.dumps(script, indent=1, ensure_ascii=False), encoding="utf-8")
+          PY
+
+      - name: Keep the stock photography clean and natural
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("pipeline/assemble.py")
+          source = path.read_text(encoding="utf-8")
+          needle = '    elif mode == "eerie_museum":\n'
+          replacement = (
+              '    elif mode == "stock_slides":\n'
+              '        grade = "eq=brightness=0.002:saturation=0.985:contrast=1.018:gamma=1.005,vignette=angle=PI/11"\n'
+              '        grain = 1\n'
+              '    elif mode == "eerie_museum":\n'
+          )
+          if needle not in source:
+              raise SystemExit("assemble.py grade insertion point not found")
+          path.write_text(source.replace(needle, replacement, 1), encoding="utf-8")
+          PY
+
+      - name: Render TikTok and YouTube scenes through the pipeline
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          bd = pathlib.Path(os.environ["BD"])
+          count = len(json.loads((bd / "script.json").read_text(encoding="utf-8"))["scenes"])
+          for index in range(count):
+              print(f"assembling {index + 1}/{count}", flush=True)
+              subprocess.run([sys.executable, "pipeline/assemble.py", str(bd), "scene", str(index)], check=True)
+              subprocess.run([sys.executable, "pipeline/assemble.py", str(bd), "youtube-scene", str(index)], check=True)
+          PY
+
+      - name: Assemble with the exact voice and no music processing
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          bd = pathlib.Path(os.environ["BD"])
+          script = json.loads((bd / "script.json").read_text(encoding="utf-8"))
+          count = len(script["scenes"])
+
+          def finish(prefix, final_name):
+              listing = bd / f"{prefix or 'portrait'}-concat.txt"
+              with listing.open("w", encoding="utf-8") as handle:
+                  for index in range(count):
+                      handle.write(f"file '{(bd / f'{prefix}seg_{index:02d}.mp4').resolve()}'\n")
+              silent = bd / f"{prefix or 'portrait'}-silent.mp4"
+              subprocess.run([
+                  "ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0",
+                  "-i", str(listing), "-c", "copy", str(silent)
+              ], check=True)
+              final = bd / final_name
+              subprocess.run([
+                  "ffmpeg", "-v", "error", "-y", "-i", str(silent), "-i", str(bd / "vo.mp3"),
+                  "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+                  "-b:a", "320k", "-shortest", "-movflags", "+faststart", str(final)
+              ], check=True)
+              return final
+
+          portrait = finish("", "final.mp4")
+          youtube = finish("youtube_", "final_youtube.mp4")
+          manifest = {
+              "delivery": {
+                  "index": 1,
+                  "label": "Exact Attached Voice — Curated Stock Slides",
+                  "portrait_video": portrait.name,
+                  "youtube_video": youtube.name,
+                  "other_choices": "not generated for this review cut"
+              },
+              "voice": script["voice_source"],
+              "mix": "direct narration map; no gain, compression, EQ, speed change, or music"
+          }
+          (bd / "music_variants.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+          PY
+
+      - name: Independent quality gate
+        run: python3 pipeline/quality_gate.py "$BD"
+
+      - name: Upload stock-slide review render
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.detect.outputs.slug }}
+          retention-days: 90
+          path: |
+            ${{ env.BD }}/final.mp4
+            ${{ env.BD }}/final_youtube.mp4
+            ${{ env.BD }}/quality_report.json
+            ${{ env.BD }}/stock_slides_report.json
+            ${{ env.BD }}/stock_slides_motion_audit.json
+            ${{ env.BD }}/music_variants.json
+            ${{ env.BD }}/CREDITS.txt
+
+      - name: Publish permanent review release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="video-${SLUG}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "Social Weather: Voice Memo Guy — Stock Slides" \
+              --notes "Curated stock-slide review cut from run $GITHUB_RUN_ID. Not approved."
+          gh release upload "$TAG" "$BD/final.mp4#${SLUG}.mp4" --clobber
+          gh release upload "$TAG" "$BD/final_youtube.mp4#${SLUG}-youtube.mp4" --clobber
+          gh release upload "$TAG" "$BD/quality_report.json" --clobber
+          gh release upload "$TAG" "$BD/stock_slides_report.json" --clobber
+          gh release upload "$TAG" "$BD/CREDITS.txt" --clobber
+
+      - name: Commit timing and audit metadata only
+        if: always()
+        shell: bash
+        run: |
+          printf '%s\n' "$GITHUB_RUN_ID" > "$BD/run-id.txt"
+          git config user.name "stock-slides-render-bot"
+          git config user.email "render@users.noreply.github.com"
+          for f in "$BD/script.json" "$BD/run-id.txt" "$BD/quality_report.json" "$BD/stock_slides_report.json" "$BD/stock_slides_motion_audit.json" "$BD/music_variants.json"; do
+            git add "$f" 2>/dev/null || true
+          done
+          git commit -m "render $SLUG: stock-slide review cut" || true
+          for attempt in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || git rebase --abort || true
+            sleep $((attempt * 2))
+          done
+          exit 1

@@ -1,0 +1,85 @@
+name: Publish renders to YouTube
+
+on:
+  workflow_dispatch:
+    inputs:
+      slugs:
+        description: "space-separated slugs to publish"
+        required: true
+        default: ""
+      force:
+        description: "Allow an intentional duplicate upload"
+        required: false
+        type: boolean
+        default: false
+  push:
+    branches:
+      - main
+    paths:
+      - pipeline/youtube_publish.request
+
+permissions:
+  contents: write
+
+concurrency:
+  group: youtube-publish-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Resolve requested slugs
+        id: request
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "push" ]]; then
+            SLUGS="$(tr '\n' ' ' < pipeline/youtube_publish.request | xargs)"
+            FORCE="false"
+          else
+            SLUGS="${{ github.event.inputs.slugs }}"
+            FORCE="${{ github.event.inputs.force }}"
+          fi
+          if [[ -z "${SLUGS}" ]]; then
+            echo "An explicit slug is required; refusing to publish the entire queue."
+            exit 1
+          fi
+          echo "slugs=${SLUGS}" >> "${GITHUB_OUTPUT}"
+          echo "force=${FORCE}" >> "${GITHUB_OUTPUT}"
+
+      - name: Publish to YouTube (Public)
+        env:
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet pillow
+          force_flag=""
+          [[ "${{ steps.request.outputs.force }}" == "true" ]] && force_flag="--force"
+          python3 pipeline/yt_publish.py $force_flag ${{ steps.request.outputs.slugs }}
+
+      - name: Commit durable publish receipt
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "youtube-publish-bot"
+          git config user.email "youtube-publish@users.noreply.github.com"
+          git add pipeline/yt_published_result.json
+          git commit -m "publish: record YouTube receipt for ${{ steps.request.outputs.slugs }}" || exit 0
+          for i in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || { git rebase --abort || true; }
+            sleep $((i * 2))
+          done
+          echo "upload succeeded but publish receipt could not be persisted" >&2
+          exit 1

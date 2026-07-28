@@ -1,0 +1,141 @@
+name: Idea to video
+# NOTE: this reacts ONLY to issues titled "Render existing:" and needs ANTHROPIC_API_KEY.
+# It is NOT the submission path. Use build/<slug>/submission.json (see THINK_TANK_CONTRACT.md).
+on:
+  issues:
+    types: [opened, labeled]
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  prepare_existing:
+    if: ${{ contains(github.event.issue.labels.*.name, 'video') && startsWith(github.event.issue.title, 'Render existing:') }}
+    runs-on: ubuntu-latest
+    outputs:
+      slug: ${{ steps.slug.outputs.slug }}
+    steps:
+      - name: Parse existing build slug
+        id: slug
+        shell: bash
+        env:
+          ISSUE_TITLE: ${{ github.event.issue.title }}
+        run: |
+          slug="${ISSUE_TITLE#Render existing:}"
+          slug="$(printf '%s' "$slug" | xargs)"
+          if ! [[ "$slug" =~ ^[a-z0-9]+(-[a-z0-9]+)*$ ]]; then
+            echo "Invalid build slug: $slug" >&2
+            exit 1
+          fi
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+
+  render_existing:
+    needs: prepare_existing
+    if: ${{ needs.prepare_existing.result == 'success' }}
+    uses: ./.github/workflows/render-existing.yml
+    with:
+      slug: ${{ needs.prepare_existing.outputs.slug }}
+    secrets: inherit
+
+  comment_existing:
+    needs: [prepare_existing, render_existing]
+    if: ${{ always() && needs.prepare_existing.result == 'success' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Comment existing-build result
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const slug = `${{ needs.prepare_existing.outputs.slug }}`;
+            const success = `${{ needs.render_existing.result }}` === 'success';
+            const body = success
+              ? `✅ Rendered the existing build **${slug}** with its committed script and voiceover. The permanent release tag is \`video-${slug}\`.`
+              : `❌ Rendering the existing build **${slug}** did not complete successfully. Check this issue's Actions run for diagnostics.`;
+            await github.rest.issues.createComment({
+              ...context.repo,
+              issue_number: context.issue.number,
+              body,
+            });
+
+  make:
+    if: ${{ contains(github.event.issue.labels.*.name, 'video') && !startsWith(github.event.issue.title, 'Render existing:') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with: { ref: main }
+
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.11", cache: pip }
+
+      - name: System deps
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+
+      - name: Python deps
+        run: pip install -q -r pipeline/requirements.txt
+
+      - name: Pipeline regression tests
+        run: python3 -m unittest discover -s pipeline/tests -v
+
+      - name: Keys
+        run: |
+          printf 'ELEVENLABS_API_KEY=%s\nPEXELS_API_KEY=%s\nELEVENLABS_VOICE_ID=%s\n' \
+            "${{ secrets.ELEVENLABS_API_KEY }}" "${{ secrets.PEXELS_API_KEY }}" \
+            "${{ secrets.ELEVENLABS_VOICE_ID || 'TX3LPaxmHKxFdv7VOQHJ' }}" > pipeline/.env
+
+      - name: Write script from the issue idea
+        id: script
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          SLUG="idea-${{ github.event.issue.number }}"
+          python3 pipeline/idea_writer.py "build/$SLUG" \
+            "${{ github.event.issue.title }}. ${{ github.event.issue.body }}"
+          echo "slug=$SLUG" >> "$GITHUB_OUTPUT"
+
+      - name: Post the script for the record
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const s = JSON.parse(fs.readFileSync(`build/${{ steps.script.outputs.slug }}/script.json`));
+            const body = "**Script draft — " + s.title + "**\n\n" +
+              s.scenes.map(x => x.text).join("\n\n") +
+              "\n\n_Rendering now; the video will be attached to this issue when done._";
+            await github.rest.issues.createComment({ ...context.repo,
+              issue_number: ${{ github.event.issue.number }}, body });
+
+      - name: Render
+        env: { SEMANTIC_CLIP: "1" }
+        run: |
+          for i in $(seq 1 200); do
+            out=$(python3 pipeline/build.py "build/${{ steps.script.outputs.slug }}" 2>&1) || { echo "$out"; exit 1; }
+            echo "$out"
+            case "$out" in *DONE*) break;; esac
+          done
+
+      - name: Upload video artifact
+        id: art
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.script.outputs.slug }}
+          path: build/${{ steps.script.outputs.slug }}/final*.mp4
+
+      - name: Comment result on the issue
+        uses: actions/github-script@v7
+        with:
+          script: |
+            await github.rest.issues.createComment({ ...context.repo,
+              issue_number: ${{ github.event.issue.number }},
+              body: "✅ Rendered. Download **final.mp4** (and the 60s cut if present) from the run artifacts:\n" +
+                    `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}\n\n` +
+                    "Reply here with feedback, or close the issue to approve." });
+
+      - name: Commit script + memory back
+        run: |
+          rm -f pipeline/.env
+          git config user.name "render-bot" && git config user.email "render@users.noreply.github.com"
+          git add pipeline/memory.json "build/${{ steps.script.outputs.slug }}/script.json" || true
+          git commit -m "idea #${{ github.event.issue.number }}: script + memory" || echo "nothing to commit"
+          git pull --rebase origin main && git push || true

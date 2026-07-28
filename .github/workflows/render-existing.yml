@@ -1,0 +1,83 @@
+name: Prepare and render existing build
+
+on:
+  workflow_call:
+    inputs:
+      slug:
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  prepare_voiceover:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Install audio tools
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+
+      - name: Restore supplied narration
+        shell: bash
+        run: |
+          set -euo pipefail
+          build="build/${{ inputs.slug }}"
+          test -f "$build/script.json"
+          shopt -s nullglob
+          opus_parts=("$build"/vo.opus.b64.part*)
+          mp3_parts=("$build"/vo.mp3.b64.part*)
+
+          if ((${#opus_parts[@]})); then
+            cat "${opus_parts[@]}" | base64 --decode > "$build/vo.opus"
+            ffmpeg -hide_banner -loglevel error -y -i "$build/vo.opus" \
+              -map_metadata -1 -map_chapters -1 -ac 1 -ar 44100 \
+              -c:a libmp3lame -b:a 128k "$build/vo.mp3"
+          elif ((${#mp3_parts[@]})); then
+            cat "${mp3_parts[@]}" | base64 --decode > "$build/vo.mp3"
+          else
+            test -s "$build/vo.mp3"
+          fi
+
+          duration="$(ffprobe -v error -show_entries format=duration \
+            -of default=noprint_wrappers=1:nokey=1 "$build/vo.mp3")"
+          size="$(stat -c '%s' "$build/vo.mp3")"
+          python3 - "$duration" "$size" <<'PY'
+          import sys
+          duration = float(sys.argv[1])
+          size = int(sys.argv[2])
+          if duration < 60.0 or size < 1_000_000:
+              raise SystemExit(
+                  f"restored narration failed validation: {duration:.2f}s, {size} bytes"
+              )
+          print(f"restored supplied narration: {duration:.2f}s, {size} bytes")
+          PY
+
+          rm -f "$build"/vo.opus "$build"/vo.opus.b64.part* "$build"/vo.mp3.b64.part*
+
+      - name: Commit restored narration
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "render-bot"
+          git config user.email "render@users.noreply.github.com"
+          git add -A "build/${{ inputs.slug }}"
+          git commit -m "video ${{ inputs.slug }}: restore supplied narration" || true
+          for i in 1 2 3 4 5; do
+            git pull --rebase origin main || { git rebase --abort || true; }
+            git push origin HEAD:main && exit 0
+            sleep $((i * 2))
+          done
+          echo "unable to publish restored narration" >&2
+          exit 1
+
+  render:
+    needs: prepare_voiceover
+    uses: ./.github/workflows/render.yml
+    with:
+      slug: ${{ inputs.slug }}
+    secrets: inherit

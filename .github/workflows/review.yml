@@ -1,0 +1,106 @@
+name: Generate scene review
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: Existing rendered video slug
+        required: true
+        type: string
+  push:
+    paths:
+      - "build/*/review.request"
+
+permissions:
+  contents: write
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Resolve video slug
+        id: target
+        shell: bash
+        run: |
+          slug="${{ inputs.slug }}"
+          if [ -z "$slug" ]; then
+            file="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -E '^build/[^/]+/review\.request$' | head -n 1)"
+            test -n "$file"
+            test -f "$file"
+            slug="$(dirname "$file" | xargs basename)"
+          fi
+          test -f "build/$slug/script.json"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+
+      - name: Mark review run
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          marker="repos/$GITHUB_REPOSITORY/contents/build/$SLUG/review-started.txt"
+          content="$(printf '%s\n' "$GITHUB_RUN_ID" | base64 -w0)"
+          sha="$(gh api "$marker" --jq .sha 2>/dev/null || true)"
+          if [ -n "$sha" ]; then
+            gh api --method PUT "$marker" -f message="Update $SLUG review run" \
+              -f content="$content" -f branch="$GITHUB_REF_NAME" -f sha="$sha"
+          else
+            gh api --method PUT "$marker" -f message="Mark $SLUG review run" \
+              -f content="$content" -f branch="$GITHUB_REF_NAME"
+          fi
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install review dependencies
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+
+      - name: Review regression tests
+        run: |
+          python -m pip install --quiet numpy
+          python -m py_compile pipeline/build.py pipeline/review.py pipeline/learn.py
+          python -m unittest pipeline.tests.test_review
+
+      - name: Download rendered video
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          mkdir -p "build/$SLUG"
+          gh api "repos/$GITHUB_REPOSITORY/releases/tags/video-$SLUG" > release.json
+          asset_url="$(jq -r '.assets[] | select(.name == "final.mp4") | .url' release.json | head -n 1)"
+          test -n "$asset_url"
+          gh api "$asset_url" -H "Accept: application/octet-stream" > "build/$SLUG/review-video.mp4"
+
+      - name: Build scene survey
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        run: |
+          python pipeline/review.py generate "build/$SLUG" --video "build/$SLUG/review-video.mp4"
+          test -s "build/$SLUG/scene-review.html"
+          test -s "build/$SLUG/scene-review.json"
+
+      - name: Upload scene survey
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.target.outputs.slug }}-scene-review
+          path: |
+            build/${{ steps.target.outputs.slug }}/scene-review.html
+            build/${{ steps.target.outputs.slug }}/scene-review.json
+
+      - name: Publish scene survey
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          gh release upload "video-$SLUG" \
+            "build/$SLUG/scene-review.html#$SLUG-scene-review.html" \
+            "build/$SLUG/scene-review.json#$SLUG-scene-review.json" --clobber

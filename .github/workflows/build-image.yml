@@ -1,0 +1,47 @@
+name: Build render image
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - "Dockerfile"
+      - "pipeline/requirements.txt"
+      - ".github/workflows/build-image.yml"
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-image
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ghcr.io/1974jwatson/tiktok-render:latest
+
+      - name: Next step reminder
+        run: |
+          {
+            echo "Image pushed: ghcr.io/1974jwatson/tiktok-render:latest"
+            echo ""
+            echo "One-time: make the package PUBLIC (Packages -> tiktok-render ->"
+            echo "Package settings -> Change visibility) then dispatch renders with"
+            echo "use_container=true to skip apt/pip setup on every run."
+          } >> "$GITHUB_STEP_SUMMARY"

@@ -1,0 +1,249 @@
+name: Record approved video
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: Build slug with an explicit approval request
+        required: true
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - "build/*/approval.request.json"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: record-video-approval-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rebase onto current learned state
+        run: git pull --rebase origin main
+
+      - name: Resolve and validate explicit approval
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          slug="${{ inputs.slug }}"
+          if [ -z "$slug" ]; then
+            request="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -E '^build/[^/]+/approval\.request\.json$' | head -n 1)"
+            test -n "$request"
+            slug="${request#build/}"
+            slug="${slug%%/*}"
+          else
+            request="build/$slug/approval.request.json"
+          fi
+          [[ "$slug" =~ ^[a-z0-9][a-z0-9-]*$ ]]
+          test -f "$request"
+
+          python3 - "$slug" "$request" "$GITHUB_OUTPUT" <<'PY'
+          import json
+          import pathlib
+          import sys
+
+          slug, request_path, output_path = sys.argv[1:]
+          build = pathlib.Path("build") / slug
+
+          def read_json(name):
+              with (build / name).open(encoding="utf-8") as handle:
+                  return json.load(handle)
+
+          request = json.load(open(request_path, encoding="utf-8"))
+          script = read_json("script.json")
+          status = read_json("render-status.json")
+          quality = read_json("quality_report.json")
+
+          if request.get("schema_version") != 1:
+              raise SystemExit("unsupported approval request schema")
+          if request.get("slug") != slug or script.get("slug") != slug:
+              raise SystemExit("approval slug does not match the build script")
+          if str(request.get("decision") or "").lower() not in {"approve", "approved"}:
+              raise SystemExit("approval request is not explicitly approved")
+
+          render_run_id = str(request.get("render_run_id") or "")
+          if not render_run_id or str(status.get("github_run_id") or "") != render_run_id:
+              raise SystemExit("approval render run does not match the completed build")
+          if status.get("state") != "done":
+              raise SystemExit("approved render is not complete")
+          if quality.get("passed") is not True or quality.get("failures"):
+              raise SystemExit("approved render did not pass delivery quality checks")
+
+          checks = request.get("required_checks") or {}
+          if checks.get("genuine_stock_only"):
+              stock = read_json("stock-only-report.json")
+              scenes = stock.get("scenes") or []
+              motion = stock.get("motion_summary") or {}
+              if (
+                  stock.get("slug") != slug
+                  or stock.get("passed") is not True
+                  or stock.get("failures")
+                  or len(scenes) != len(script.get("scenes") or [])
+                  or not all(scene.get("passed") is True for scene in scenes)
+                  or float(motion.get("true_motion_ratio", -1)) != 1.0
+                  or float(motion.get("still_source_ratio", -1)) != 0.0
+              ):
+                  raise SystemExit("genuine-stock-only approval gate did not pass exactly")
+
+          exact = checks.get("exact_audio") or {}
+          if exact:
+              audio = read_json("audio-verification.json")
+              expected = {
+                  "sha256": exact.get("sha256"),
+                  "size_bytes": int(exact.get("size_bytes")),
+                  "duration_seconds": float(exact.get("duration_seconds")),
+                  "format": exact.get("format"),
+              }
+              if (
+                  audio.get("exact_bytes_restored") is not True
+                  or audio.get("transcoded_before_pipeline") is not False
+                  or audio.get("sha256") != expected["sha256"]
+                  or int(audio.get("size_bytes", -1)) != expected["size_bytes"]
+                  or abs(float(audio.get("duration_seconds", -1)) - expected["duration_seconds"]) > 0.001
+                  or audio.get("format") != expected["format"]
+              ):
+                  raise SystemExit("exact-audio approval gate did not pass exactly")
+
+          memory = json.load(open("pipeline/memory.json", encoding="utf-8"))
+          already_learned = any(
+              video.get("slug") == slug for video in memory.get("videos", [])
+          )
+          durable_note = str(request.get("durable_note") or "").strip()
+          note_needed = bool(durable_note and durable_note not in memory.get("notes", []))
+
+          record_path = build / "approval-record.json"
+          already_recorded = False
+          if record_path.exists():
+              prior = json.load(record_path.open(encoding="utf-8"))
+              already_recorded = (
+                  str(prior.get("render_run_id") or "") == render_run_id
+                  and str(prior.get("decision") or "").lower() == "approved"
+              )
+
+          with open(output_path, "a", encoding="utf-8") as output:
+              output.write(f"slug={slug}\n")
+              output.write(f"request={request_path}\n")
+              output.write(f"learn={'false' if already_learned else 'true'}\n")
+              output.write(f"note={'true' if note_needed else 'false'}\n")
+              output.write(f"record={'false' if already_recorded else 'true'}\n")
+          print(
+              f"validated explicit approval for {slug}: "
+              f"run {render_run_id}, {len(script.get('scenes') or [])} scenes"
+          )
+          PY
+
+      - uses: actions/setup-python@v5
+        if: steps.target.outputs.learn == 'true'
+        with:
+          python-version: "3.11"
+
+      - name: Install learning dependency
+        if: steps.target.outputs.learn == 'true'
+        run: python -m pip install --quiet numpy
+
+      - name: Learning regression test
+        if: steps.target.outputs.learn == 'true'
+        run: |
+          python -m py_compile pipeline/learn.py pipeline/profiles.py pipeline/taste.py
+          python -m unittest pipeline.tests.test_profile_learning
+
+      - name: Record approved clips and query choices
+        if: steps.target.outputs.learn == 'true'
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        run: python3 pipeline/learn.py record "build/$SLUG"
+
+      - name: Record durable approval note
+        if: steps.target.outputs.note == 'true'
+        env:
+          REQUEST: ${{ steps.target.outputs.request }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          note="$(python3 - "$REQUEST" <<'PY'
+          import json
+          import sys
+          print(json.load(open(sys.argv[1], encoding="utf-8"))["durable_note"])
+          PY
+          )"
+          python3 pipeline/learn.py note "$note"
+
+      - name: Write approval audit record
+        if: steps.target.outputs.record == 'true'
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+          REQUEST: ${{ steps.target.outputs.request }}
+        run: |
+          python3 - "$SLUG" "$REQUEST" <<'PY'
+          import glob
+          import json
+          import os
+          import pathlib
+          import sys
+
+          slug, request_path = sys.argv[1:]
+          build = pathlib.Path("build") / slug
+          request = json.load(open(request_path, encoding="utf-8"))
+          script = json.load((build / "script.json").open(encoding="utf-8"))
+          memory = json.load(open("pipeline/memory.json", encoding="utf-8"))
+          learned = next(
+              (video for video in reversed(memory.get("videos", [])) if video.get("slug") == slug),
+              None,
+          )
+          if learned is None:
+              raise SystemExit("approval was not found in learned video memory")
+
+          payload = {
+              "schema_version": 1,
+              "slug": slug,
+              "title": script.get("title"),
+              "decision": "approved",
+              "approved_at": request.get("approved_at"),
+              "approval_source": request.get("approval_source"),
+              "user_feedback": request.get("user_feedback"),
+              "render_run_id": str(request.get("render_run_id")),
+              "recording_workflow_run_id": os.environ.get("GITHUB_RUN_ID"),
+              "scene_count": len(script.get("scenes") or []),
+              "recorded_clip_count": len(learned.get("clips") or []),
+              "required_checks": request.get("required_checks") or {},
+              "taste_embedding_count": len(glob.glob(str(build / "emb_*.npy"))),
+              "memory_recorded": True,
+          }
+          with (build / "approval-record.json").open("w", encoding="utf-8") as handle:
+              json.dump(payload, handle, indent=2, ensure_ascii=False)
+              handle.write("\n")
+          PY
+
+      - name: Commit learned approval
+        if: steps.target.outputs.learn == 'true' || steps.target.outputs.note == 'true' || steps.target.outputs.record == 'true'
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "approval-bot"
+          git config user.email "approval@users.noreply.github.com"
+          git add pipeline/memory.json "build/$SLUG/approval-record.json"
+          test ! -f pipeline/taste.npz || git add pipeline/taste.npz
+          git commit -m "approve $SLUG: record James's final approval"
+          for i in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || git rebase --abort || true
+            sleep $((i * 2))
+          done
+          echo "unable to push learned approval after 5 attempts" >&2
+          exit 1
+
+      - name: Report existing approval
+        if: steps.target.outputs.learn != 'true' && steps.target.outputs.note != 'true' && steps.target.outputs.record != 'true'
+        run: echo "This exact approval is already recorded; no duplicate learning was applied."

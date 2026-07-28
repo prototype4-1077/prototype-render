@@ -1,0 +1,104 @@
+name: WhisperX shadow integrity
+
+on:
+  pull_request:
+    paths:
+      - "pipeline/whisperx_*.py"
+      - "pipeline/requirements-whisperx.txt"
+      - "pipeline/WHISPERX_SHADOW.md"
+      - "pipeline/tests/test_whisperx_challenger.py"
+      - "pipeline/tests/fixtures/whisperx-result.json"
+      - ".github/workflows/whisperx-shadow*.yml"
+  push:
+    branches: [main]
+    paths:
+      - "pipeline/whisperx_*.py"
+      - "pipeline/requirements-whisperx.txt"
+      - "pipeline/WHISPERX_SHADOW.md"
+      - "pipeline/tests/test_whisperx_challenger.py"
+      - "pipeline/tests/fixtures/whisperx-result.json"
+      - ".github/workflows/whisperx-shadow*.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile challenger and ledger
+        run: |
+          python3 -m py_compile \
+            pipeline/whisperx_challenger.py \
+            pipeline/whisperx_benchmark_ledger.py
+
+      - name: Test WhisperX result flattening
+        run: python3 -m unittest pipeline.tests.test_whisperx_challenger.WhisperXChallengerTests.test_flatten_whisperx_segments -v
+
+      - name: Test production timing immutability
+        run: python3 -m unittest pipeline.tests.test_whisperx_challenger.WhisperXChallengerTests.test_shadow_report_never_writes_production_timing -v
+
+      - name: Test manual-reference nomination gate
+        run: python3 -m unittest pipeline.tests.test_whisperx_challenger.WhisperXChallengerTests.test_manual_reference_can_nominate_but_not_promote -v
+
+      - name: Test aggregate evidence floor
+        run: python3 -m unittest pipeline.tests.test_whisperx_challenger.WhisperXChallengerTests.test_ledger_waits_for_minimum_evidence -v
+
+      - name: Exercise fixture challenger without WhisperX installation
+        shell: bash
+        run: |
+          set -euo pipefail
+          build=/tmp/whisperx-shadow-fixture
+          mkdir -p "$build"
+          cat > "$build/script.json" <<'JSON'
+          {
+            "title": "Fixture",
+            "slug": "fixture",
+            "voiceover_config": {"provider": "ElevenLabs"},
+            "scenes": [
+              {"text": "The signal starts here.", "start": 0.2, "duration": 1.8},
+              {"text": "Then 4 doors open.", "start": 2.0, "duration": 2.0}
+            ]
+          }
+          JSON
+          cat > "$build/words.json" <<'JSON'
+          [
+            {"w":"The","s":0.25,"e":0.45},
+            {"w":"signal","s":0.48,"e":0.88},
+            {"w":"starts","s":0.90,"e":1.20},
+            {"w":"here","s":1.22,"e":1.60},
+            {"w":"Then","s":2.12,"e":2.38},
+            {"w":"4","s":2.40,"e":2.55},
+            {"w":"doors","s":2.57,"e":2.90},
+            {"w":"open","s":2.92,"e":3.35}
+          ]
+          JSON
+          printf 'fixture-audio' > "$build/vo.mp3"
+          script_before="$(sha256sum "$build/script.json" | cut -d' ' -f1)"
+          words_before="$(sha256sum "$build/words.json" | cut -d' ' -f1)"
+          python3 pipeline/whisperx_challenger.py "$build" \
+            --raw-result pipeline/tests/fixtures/whisperx-result.json
+          test "$script_before" = "$(sha256sum "$build/script.json" | cut -d' ' -f1)"
+          test "$words_before" = "$(sha256sum "$build/words.json" | cut -d' ' -f1)"
+          python3 - "$build/alignment-challenger.json" <<'PY'
+          import json, sys
+          report = json.load(open(sys.argv[1], encoding='utf-8'))
+          assert report['mode'] == 'shadow_only'
+          assert report['production_timing_written'] is False
+          assert report['promotion_automatic'] is False
+          assert report['challenger']['script_word_coverage'] == 1.0
+          assert report['challenger']['special_token_coverage'] == 1.0
+          PY
+
+      - name: Verify stable version pin and no production dependency coupling
+        run: |
+          grep -Fx 'whisperx==3.8.6' pipeline/requirements-whisperx.txt
+          ! grep -qi '^whisperx' pipeline/requirements.txt

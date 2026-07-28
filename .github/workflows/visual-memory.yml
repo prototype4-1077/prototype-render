@@ -1,0 +1,85 @@
+name: Visual review memory
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "build/*/script.json"
+      - "build/*/scene-feedback.request.json"
+      - "build/*/scene-review-feedback.json"
+      - "build/*/feedback-application.json"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: visual-memory-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build FiftyOne-compatible manifest
+        run: python3 intelligence_stack/fiftyone/export_visual_memory.py
+
+      - name: Separate reviewed evidence from automated screening
+        run: python3 intelligence_stack/fiftyone/analyze_visual_memory.py
+
+      - name: Validate visual memory
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          manifest = Path('concept/visual_memory/manifest.jsonl')
+          records = [json.loads(line) for line in manifest.read_text(encoding='utf-8').splitlines() if line.strip()]
+          ids = [item['id'] for item in records]
+          assert len(ids) == len(set(ids)), 'duplicate visual-memory IDs'
+          for item in records:
+              assert 'narration' in item
+              assert 'decision' in item
+              assert 'risk' in item
+          action = json.load(open('concept/visual_memory/action_report.json', encoding='utf-8'))
+          assert action['records'] == len(records)
+          assert 'reviewed_feedback_tags' in action
+          assert 'automated_risk_tags' in action
+          assert action['interpretation_boundary']
+          print('validated', len(records), 'visual-memory records and', len(action['actions']), 'actions')
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: visual-memory-${{ github.run_id }}
+          path: |
+            concept/visual_memory/manifest.jsonl
+            concept/visual_memory/summary.json
+            concept/visual_memory/action_report.json
+          retention-days: 30
+
+      - name: Commit compact visual memory and action analysis
+        shell: bash
+        run: |
+          git config user.name "visual-memory-bot"
+          git config user.email "visual-memory@users.noreply.github.com"
+          git add \
+            concept/visual_memory/manifest.jsonl \
+            concept/visual_memory/summary.json \
+            concept/visual_memory/action_report.json
+          git commit -m "visual-memory: refresh scene evidence and actions" || exit 0
+          for i in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || git rebase --abort || true
+            sleep $((i * 2))
+          done
+          echo "unable to push visual memory" >&2
+          exit 1

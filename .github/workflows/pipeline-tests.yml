@@ -1,0 +1,36 @@
+name: Pipeline tests
+
+on:
+  pull_request:
+    paths:
+      - "pipeline/**"
+      - ".github/workflows/render.yml"
+      - ".github/workflows/pipeline-tests.yml"
+  push:
+    branches: [main]
+    paths:
+      - "pipeline/**"
+      - ".github/workflows/render.yml"
+      - ".github/workflows/pipeline-tests.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - name: System deps
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+      - name: Python deps
+        run: pip install -q -r pipeline/requirements.txt
+      - name: Compile pipeline
+        run: python3 -m compileall -q pipeline
+      - name: Regression tests
+        run: python3 -m unittest discover -s pipeline/tests -v

@@ -1,0 +1,279 @@
+name: Render stock-slide silent picture master
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "build/**/stockslides-silent.request"
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      slug: ${{ steps.slug.outputs.slug }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: slug
+        shell: bash
+        run: |
+          file="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -E '^build/[^/]+/stockslides-silent\.request$' | head -n 1)"
+          test -n "$file"
+          slug="${file#build/}"
+          slug="${slug%/stockslides-silent.request}"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+      - name: Mark stock-slide render started
+        shell: bash
+        run: |
+          slug="${{ steps.slug.outputs.slug }}"
+          printf '%s\n' "$GITHUB_RUN_ID" > "build/$slug/run-id.txt"
+          git config user.name "stock-slides-render-bot"
+          git config user.email "render@users.noreply.github.com"
+          git add "build/$slug/run-id.txt"
+          git commit -m "render $slug: stock slides started $GITHUB_RUN_ID" || true
+          git push
+
+  render:
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: stock-slides-silent-${{ needs.detect.outputs.slug }}
+      cancel-in-progress: false
+    env:
+      SLUG: ${{ needs.detect.outputs.slug }}
+      BD: build/${{ needs.detect.outputs.slug }}
+      PYTHONUNBUFFERED: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: System dependencies
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+
+      - name: Python dependencies and pipeline tests
+        run: |
+          pip install -q -r pipeline/requirements.txt
+          python3 -c 'import sys; sys.path.insert(0,"pipeline"); import build; build.ensure_fonts()'
+          python3 -m unittest discover -s pipeline/tests -v
+
+      - name: Apply exact attachment timings
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib
+          bd = pathlib.Path(os.environ["BD"])
+          script_path = bd / "script.json"
+          timings_path = bd / "timings.json"
+          script = json.loads(script_path.read_text(encoding="utf-8"))
+          timings = json.loads(timings_path.read_text(encoding="utf-8"))
+          scenes = script.get("scenes") or []
+          rows = timings.get("scenes") or []
+          if len(scenes) != len(rows):
+              raise SystemExit(f"timing count mismatch: {len(scenes)} vs {len(rows)}")
+          for index, (scene, row) in enumerate(zip(scenes, rows)):
+              if scene.get("text") != row.get("text"):
+                  raise SystemExit(f"scene {index} narration differs from forced-alignment transcript")
+              for stale in (
+                  "clip", "motion_verified", "motion_evidence", "stock_id", "pexels_id",
+                  "stock_frame_url", "source_url", "kw_overlays", "youtube_kw_overlays",
+                  "stock_photo_ids", "stock_slide_evidence",
+              ):
+                  scene.pop(stale, None)
+              scene["start"] = float(row["start"])
+              scene["duration"] = float(row["duration"])
+              scene["kw_times"] = dict(row.get("kw_times") or {})
+          script.pop("voiceover", None)
+          script["visual_mode"] = "stock_slides"
+          script["layout"] = "letterbox"
+          script["review_status"] = "not_approved"
+          script["timing_source"] = timings.get("alignment")
+          script["expected_voice_duration"] = float(timings["voice_duration"])
+          script_path.write_text(json.dumps(script, indent=1, ensure_ascii=False), encoding="utf-8")
+          total = sum(float(scene["duration"]) for scene in scenes)
+          if abs(total - float(timings["voice_duration"])) > 0.002:
+              raise SystemExit(f"timed picture duration mismatch: {total}")
+          print(f"applied {len(scenes)} exact-voice scene timings; total={total:.3f}s")
+          PY
+
+      - name: Curate and animate photographic stock slides
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
+        run: |
+          python3 pipeline/stock_slides.py "$BD" render-all
+          python3 pipeline/stock_slides.py "$BD" audit
+
+      - name: Generate captions and Social Weather title
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          sys.path.insert(0, "pipeline")
+          from captions import caption_png, title_png, youtube_caption_png, youtube_title_png
+          bd = pathlib.Path(os.environ["BD"])
+          script_path = bd / "script.json"
+          script = json.loads(script_path.read_text(encoding="utf-8"))
+          for index, scene in enumerate(script["scenes"]):
+              overlays = caption_png(
+                  scene["text"], scene.get("keywords", []), str(bd / f"cap_{index:02d}.png"),
+                  kw_overlay_prefix=str(bd / f"cap_{index:02d}_kw"),
+              )
+              scene["kw_overlays"] = [
+                  {"kw": keyword, "png": pathlib.Path(png).name} for keyword, png in overlays
+              ]
+              youtube = youtube_caption_png(
+                  scene["text"], scene.get("keywords", []), str(bd / f"youtube_cap_{index:02d}.png"),
+                  kw_overlay_prefix=str(bd / f"youtube_cap_{index:02d}_kw"),
+              )
+              scene["youtube_kw_overlays"] = [
+                  {"kw": keyword, "png": pathlib.Path(png).name} for keyword, png in youtube
+              ]
+          eyebrow = script.get("title_eyebrow") or script.get("series_label")
+          title_png(script["title"], str(bd / "title.png"), eyebrow=eyebrow)
+          youtube_title_png(script["title"], str(bd / "youtube_title.png"), eyebrow=eyebrow)
+          script_path.write_text(json.dumps(script, indent=1, ensure_ascii=False), encoding="utf-8")
+          PY
+
+      - name: Apply clean editorial photo grade
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("pipeline/assemble.py")
+          source = path.read_text(encoding="utf-8")
+          needle = '    elif mode == "eerie_museum":\n'
+          replacement = (
+              '    elif mode == "stock_slides":\n'
+              '        grade = "eq=brightness=0.002:saturation=0.985:contrast=1.018:gamma=1.005,vignette=angle=PI/11"\n'
+              '        grain = 1\n'
+              '    elif mode == "eerie_museum":\n'
+          )
+          if needle not in source:
+              raise SystemExit("assemble.py grade insertion point not found")
+          path.write_text(source.replace(needle, replacement, 1), encoding="utf-8")
+          PY
+
+      - name: Render TikTok and YouTube scene masters through the pipeline
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          bd = pathlib.Path(os.environ["BD"])
+          count = len(json.loads((bd / "script.json").read_text(encoding="utf-8"))["scenes"])
+          for index in range(count):
+              print(f"pipeline assembly {index + 1}/{count}", flush=True)
+              subprocess.run([sys.executable, "pipeline/assemble.py", str(bd), "scene", str(index)], check=True)
+              subprocess.run([sys.executable, "pipeline/assemble.py", str(bd), "youtube-scene", str(index)], check=True)
+          PY
+
+      - name: Concatenate silent picture masters
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          bd = pathlib.Path(os.environ["BD"])
+          script = json.loads((bd / "script.json").read_text(encoding="utf-8"))
+          count = len(script["scenes"])
+          def concatenate(prefix, name):
+              listing = bd / f"{prefix or 'portrait'}-concat.txt"
+              with listing.open("w", encoding="utf-8") as handle:
+                  for index in range(count):
+                      handle.write(f"file '{(bd / f'{prefix}seg_{index:02d}.mp4').resolve()}'\n")
+              output = bd / name
+              subprocess.run([
+                  "ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0",
+                  "-i", str(listing), "-c", "copy", "-movflags", "+faststart", str(output),
+              ], check=True)
+          concatenate("", "final_silent.mp4")
+          concatenate("youtube_", "final_youtube_silent.mp4")
+          PY
+
+      - name: Validate silent masters and create review sheet
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          bd = pathlib.Path(os.environ["BD"])
+          expected = float(json.loads((bd / "timings.json").read_text())["voice_duration"])
+          checks = [
+              (bd / "final_silent.mp4", 1080, 1920),
+              (bd / "final_youtube_silent.mp4", 1920, 1080),
+          ]
+          report = {"expected_duration": expected, "outputs": {}}
+          for path, width, height in checks:
+              raw = subprocess.check_output([
+                  "ffprobe", "-v", "error", "-show_streams", "-show_format",
+                  "-print_format", "json", str(path),
+              ], text=True)
+              payload = json.loads(raw)
+              videos = [row for row in payload["streams"] if row.get("codec_type") == "video"]
+              audios = [row for row in payload["streams"] if row.get("codec_type") == "audio"]
+              if len(videos) != 1 or audios:
+                  raise SystemExit(f"unexpected stream layout in {path.name}")
+              video = videos[0]
+              actual_duration = float(payload["format"]["duration"])
+              if (int(video.get("width") or 0), int(video.get("height") or 0)) != (width, height):
+                  raise SystemExit(f"wrong dimensions for {path.name}")
+              if abs(actual_duration - expected) > 0.45:
+                  raise SystemExit(f"duration drift in {path.name}: {actual_duration:.3f}s")
+              subprocess.run([
+                  "ffmpeg", "-hide_banner", "-nostats", "-v", "error", "-xerror",
+                  "-i", str(path), "-f", "null", "-",
+              ], check=True)
+              report["outputs"][path.name] = {
+                  "width": width, "height": height, "duration": actual_duration,
+                  "video_codec": video.get("codec_name"), "has_audio": False,
+              }
+          motion = json.loads((bd / "stock_slides_motion_audit.json").read_text())
+          failures = [key for key, row in motion["scenes"].items() if not row["motion"].get("passes")]
+          if failures:
+              raise SystemExit("stock-slide motion audit failed: " + ", ".join(failures))
+          report["stock_slide_motion_scenes"] = len(motion["scenes"])
+          report["motion_failures"] = failures
+          (bd / "silent_master_validation.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+          PY
+          ffmpeg -v error -y -i "$BD/final_youtube_silent.mp4" \
+            -vf "fps=16/180.271,scale=480:-1,tile=4x4:padding=6:margin=6" \
+            -frames:v 1 "$BD/stock_slides_review_sheet.jpg"
+
+      - name: Upload silent pipeline masters
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.detect.outputs.slug }}-silent
+          retention-days: 90
+          path: |
+            ${{ env.BD }}/final_silent.mp4
+            ${{ env.BD }}/final_youtube_silent.mp4
+            ${{ env.BD }}/stock_slides_review_sheet.jpg
+            ${{ env.BD }}/silent_master_validation.json
+            ${{ env.BD }}/stock_slides_report.json
+            ${{ env.BD }}/stock_slides_motion_audit.json
+            ${{ env.BD }}/CREDITS.txt
+            ${{ env.BD }}/script.json
+            ${{ env.BD }}/timings.json
+
+      - name: Commit stock-slide audit metadata
+        if: always()
+        shell: bash
+        run: |
+          printf '%s\n' "$GITHUB_RUN_ID" > "$BD/run-id.txt"
+          git config user.name "stock-slides-render-bot"
+          git config user.email "render@users.noreply.github.com"
+          for f in "$BD/script.json" "$BD/run-id.txt" "$BD/stock_slides_report.json" "$BD/stock_slides_motion_audit.json" "$BD/silent_master_validation.json"; do
+            git add "$f" 2>/dev/null || true
+          done
+          git commit -m "render $SLUG: silent stock-slide masters" || true
+          for attempt in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || git rebase --abort || true
+            sleep $((attempt * 2))
+          done
+          exit 1

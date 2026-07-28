@@ -1,0 +1,120 @@
+name: OpenTelemetry render integrity
+
+on:
+  pull_request:
+    paths:
+      - "pipeline/observability.py"
+      - "pipeline/governor_observed.py"
+      - "pipeline/governor.py"
+      - "pipeline/telemetry_report.py"
+      - "pipeline/tests/test_observability.py"
+      - "pipeline/requirements.txt"
+      - "pipeline/OPENTELEMETRY.md"
+      - ".github/workflows/opentelemetry-integrity.yml"
+      - ".github/workflows/telemetry-post-render.yml"
+  push:
+    branches: [main]
+    paths:
+      - "pipeline/observability.py"
+      - "pipeline/governor_observed.py"
+      - "pipeline/governor.py"
+      - "pipeline/telemetry_report.py"
+      - "pipeline/tests/test_observability.py"
+      - "pipeline/requirements.txt"
+      - "pipeline/OPENTELEMETRY.md"
+      - ".github/workflows/opentelemetry-integrity.yml"
+      - ".github/workflows/telemetry-post-render.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install focused OpenTelemetry dependencies
+        run: |
+          pip install -q \
+            opentelemetry-api==1.44.0 \
+            opentelemetry-sdk==1.44.0 \
+            opentelemetry-exporter-otlp-proto-http==1.44.0
+
+      - name: Compile instrumentation
+        run: |
+          python3 -m py_compile \
+            pipeline/observability.py \
+            pipeline/governor_observed.py \
+            pipeline/governor.py \
+            pipeline/telemetry_report.py
+
+      - name: Run tracing invariants
+        run: python3 -m unittest pipeline.tests.test_observability -v
+
+      - name: Exercise one-trace scene fixture
+        shell: bash
+        run: |
+          set -euo pipefail
+          build=/tmp/otel-render
+          mkdir -p "$build"
+          cat > "$build/script.json" <<'JSON'
+          {
+            "title":"Telemetry Fixture",
+            "slug":"otel-render",
+            "scenes":[
+              {
+                "text":"One signal moves.",
+                "start":0.0,
+                "duration":2.0,
+                "visual_function":"mechanism",
+                "symbol_family":"signals",
+                "image_prompt":"this prompt must be hashed, never stored",
+                "generation_provider":"fixture",
+                "generation_model":"fixture-v1"
+              }
+            ]
+          }
+          JSON
+          cat > /tmp/hero.py <<'PY'
+          print('fixture hero command')
+          PY
+          export VIDEO_TRACE_ID=0123456789abcdef0123456789abcdef
+          export GOVERNOR_CONSOLE_HEARTBEATS=0
+          PYTHONPATH=pipeline python3 - "$build" <<'PY'
+          import sys
+          from governor import PipelineGovernor
+          build = sys.argv[1]
+          governor = PipelineGovernor(build, heartbeat_seconds=0.1)
+          result = governor.run(
+              [sys.executable, '/tmp/hero.py', build, '0'],
+              timeout=10,
+          )
+          assert result.returncode == 0
+          governor.finalize('done', passes=1)
+          PY
+          PYTHONPATH=pipeline python3 pipeline/telemetry_report.py "$build" --require-spans
+          python3 - "$build/telemetry-summary.json" "$build/telemetry/spans.jsonl" <<'PY'
+          import json, sys
+          summary = json.load(open(sys.argv[1], encoding='utf-8'))
+          spans = open(sys.argv[2], encoding='utf-8').read()
+          assert summary['single_trace'] is True, summary
+          assert summary['trace_ids'] == ['0123456789abcdef0123456789abcdef']
+          assert summary['scene_span_count'] == 1, summary
+          assert summary['privacy']['prompt_text_recorded'] is False
+          assert 'this prompt must be hashed' not in spans
+          assert 'video.prompt.sha256' in spans
+          PY
+
+      - name: Verify stable pins and signal scope
+        run: |
+          grep -Fx 'opentelemetry-api==1.44.0' pipeline/requirements.txt
+          grep -Fx 'opentelemetry-sdk==1.44.0' pipeline/requirements.txt
+          grep -Fx 'opentelemetry-exporter-otlp-proto-http==1.44.0' pipeline/requirements.txt
+          ! grep -qi 'opentelemetry.*log' pipeline/requirements.txt

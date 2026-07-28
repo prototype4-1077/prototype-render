@@ -1,0 +1,85 @@
+name: Lower-model visual contract
+
+on:
+  pull_request:
+    paths:
+      - "build/*/script.json"
+      - "pipeline/visual_risk.py"
+      - "pipeline/LOWER_MODEL_VISUAL_CONTRACT.md"
+      - "intelligence_stack/comfy/**"
+      - ".github/workflows/visual-contract.yml"
+  push:
+    branches: [main]
+    paths:
+      - "build/*/script.json"
+      - "pipeline/visual_risk.py"
+      - "pipeline/LOWER_MODEL_VISUAL_CONTRACT.md"
+      - "intelligence_stack/comfy/**"
+      - ".github/workflows/visual-contract.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  inspect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Inspect every concept script
+        run: |
+          mkdir -p /tmp/visual-risk
+          python3 - <<'PY'
+          import glob
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, 'pipeline')
+          from visual_risk import assess_script
+
+          failures = []
+          inspected = 0
+          enforced = 0
+          for path in sorted(glob.glob('build/*/script.json')):
+              try:
+                  script = json.load(open(path, encoding='utf-8'))
+              except Exception as exc:
+                  failures.append(f'{path}: invalid JSON: {exc}')
+                  continue
+              report = assess_script(script)
+              inspected += 1
+              slug = script.get('slug') or os.path.basename(os.path.dirname(path))
+              with open(f'/tmp/visual-risk/{slug}.json', 'w', encoding='utf-8') as handle:
+                  json.dump(report, handle, indent=2, ensure_ascii=False)
+                  handle.write('\n')
+              hard = int(script.get('visual_contract_version') or 0) >= 1
+              if hard:
+                  enforced += 1
+                  if not report['passed']:
+                      blocked = ', '.join(
+                          f"scene {item['scene_index'] + 1}={item['effective_risk_score']}"
+                          for item in report['blocked']
+                      )
+                      failures.append(f'{path}: visual contract blocked {blocked}')
+              print(
+                  f"{path}: blocked={report['blocked_count']} review={report['review_count']} "
+                  f"enforced={hard}"
+              )
+          print(f'inspected={inspected} enforced={enforced}')
+          if failures:
+              raise SystemExit('\n'.join(failures))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: visual-risk-${{ github.run_id }}
+          path: /tmp/visual-risk
+          retention-days: 30

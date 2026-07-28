@@ -1,0 +1,89 @@
+name: Perpetual Frontier cycle
+
+on:
+  schedule:
+    - cron: "17 13 * * 1"
+  workflow_dispatch:
+    inputs:
+      cycle_date:
+        description: Optional YYYY-MM-DD date for deterministic Dream Mode
+        required: false
+        type: string
+  push:
+    branches: [main]
+    paths:
+      - "concept/perpetual_frontier.py"
+      - "concept/evolution_constitution.json"
+      - "concept/provisional_rules.json"
+      - "concept/capability_constitution.json"
+      - "concept/expedition_library.json"
+      - ".github/workflows/perpetual-frontier-cycle.yml"
+      - "concept/frontier.json"
+      - "concept/patterns.json"
+      - "concept/catalog.json"
+      - "concept/external_signals/LATEST.json"
+      - "build/*/yt_stats.json"
+      - "build/*/scene-feedback.request.json"
+      - "build/*/scene-review-feedback.json"
+      - "build/*/telemetry-summary.json"
+      - "build/*/quality_report.json"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: perpetual-frontier-cycle
+  cancel-in-progress: false
+
+jobs:
+  evolve:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run constitutional evolution cycle
+        env:
+          REQUESTED_DATE: ${{ inputs.cycle_date }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          date_value="${REQUESTED_DATE:-$(date -u +%F)}"
+          python3 concept/perpetual_frontier.py --root . --date "$date_value"
+          python3 - <<'PY'
+          import json
+          state = json.load(open('concept/evolution_state/LATEST.json', encoding='utf-8'))
+          assert state['production_files_modified'] is False
+          assert state['requires_human_selection'] is True
+          assert state['authority_boundary']
+          PY
+
+      - name: Upload complete evolution evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: perpetual-frontier-${{ github.run_id }}
+          retention-days: 90
+          if-no-files-found: error
+          path: concept/evolution_state/**
+
+      - name: Commit observations and proposals only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "frontier-loop-bot"
+          git config user.email "frontier-loop@users.noreply.github.com"
+          git add concept/evolution_state
+          git commit -m "frontier-loop: update hypotheses and experiment queue" || exit 0
+          for attempt in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || git rebase --abort || true
+            sleep $((attempt * 2))
+          done
+          echo "unable to push evolution state after 5 attempts" >&2
+          exit 1

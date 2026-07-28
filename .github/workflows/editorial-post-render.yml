@@ -1,0 +1,256 @@
+name: Build editorial revision cache
+
+on:
+  workflow_run:
+    workflows: ["Render video"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: editorial-post-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  build-cache:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Resolve source render and slug
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ github.event.workflow_run.id }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          slug="$(gh api "repos/$REPOSITORY/actions/runs/$SOURCE_RUN/artifacts" --paginate \
+            --jq '.artifacts[] | select((.name | contains("-governor-") | not)) | .name' | head -n 1)"
+          test -n "$slug"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+          echo "source_run=$SOURCE_RUN" >> "$GITHUB_OUTPUT"
+          echo "resolved render $SOURCE_RUN -> $slug"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: System and Python dependencies
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ffmpeg
+          pip install -q -r pipeline/requirements.txt
+
+      - name: Download original finished artifact and lock approved audio
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ steps.target.outputs.slug }}
+          SOURCE_RUN: ${{ steps.target.outputs.source_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/original "build/$SLUG"
+          gh run download "$SOURCE_RUN" -n "$SLUG" -D /tmp/original
+          shopt -s nullglob
+          originals=(/tmp/original/final*.mp4)
+          test "${#originals[@]}" -ge 1
+          for video in "${originals[@]}"; do
+            cp "$video" "build/$SLUG/original_$(basename "$video")"
+          done
+          approved="/tmp/original/final_youtube.mp4"
+          test -s "$approved" || approved="/tmp/original/final.mp4"
+          test -s "$approved" || approved="${originals[0]}"
+          python3 pipeline/locked_audio.py extract "$approved" "build/$SLUG"
+          python3 pipeline/locked_audio.py verify "build/$SLUG"
+
+      - name: Restore cached footage and narration
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            build/${{ steps.target.outputs.slug }}/clip_*.mp4
+            build/${{ steps.target.outputs.slug }}/vo.mp3
+            build/${{ steps.target.outputs.slug }}/words.json
+            build/${{ steps.target.outputs.slug }}/voiceover-manifest.json
+          key: editorial-${{ steps.target.outputs.slug }}-${{ github.run_id }}
+          restore-keys: |
+            footage-v2-${{ steps.target.outputs.slug }}-
+
+      - name: Validate restored visual cache
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s "build/$SLUG/clip_00.mp4"
+          test -s "build/$SLUG/vo.mp3"
+
+      - name: API keys for deterministic scene-master rebuild
+        run: |
+          printf 'ELEVENLABS_API_KEY=%s\nPEXELS_API_KEY=%s\nELEVENLABS_VOICE_ID=%s\n' \
+            "${{ secrets.ELEVENLABS_API_KEY }}" "${{ secrets.PEXELS_API_KEY }}" \
+            "${{ secrets.ELEVENLABS_VOICE_ID || 'TX3LPaxmHKxFdv7VOQHJ' }}" > pipeline/.env
+
+      - name: Rebuild scene masters from cached clips
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+          EDITORIAL_BUILD_PASS_BUDGET: "1800"
+          PYTHONUNBUFFERED: "1"
+        run: python3 pipeline/editorial_cache_build.py "build/$SLUG" --max-passes 40
+
+      - name: Reapply exact approved delivery audio
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          finals=(build/$SLUG/final*.mp4)
+          test "${#finals[@]}" -ge 1
+          for video in "${finals[@]}"; do
+            python3 pipeline/locked_audio.py apply "$video" "build/$SLUG"
+          done
+          python3 pipeline/locked_audio.py verify "build/$SLUG"
+
+      - name: Write and verify canonical OTIO timeline
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        run: |
+          python3 pipeline/editorial_timeline.py build "build/$SLUG"
+          python3 pipeline/editorial_timeline.py verify "build/$SLUG"
+
+      - name: Verify original and rebuilt exports
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          for original in build/$SLUG/original_final*.mp4; do
+            name="$(basename "$original")"
+            python3 pipeline/export_verify.py "build/$SLUG" "$name" --frames
+            canvas="portrait"
+            [[ "$name" == *youtube* ]] && canvas="youtube"
+            [[ "$name" == *short* ]] && canvas="short"
+            mv "build/$SLUG/export-verification-$canvas.json" \
+               "build/$SLUG/export-verification-original-$canvas.json"
+            mv "build/$SLUG/detected-scenes-$canvas.csv" \
+               "build/$SLUG/detected-scenes-original-$canvas.csv"
+            if [ -d "build/$SLUG/verification_frames/$canvas" ]; then
+              rm -rf "build/$SLUG/verification_frames/original-$canvas"
+              mv "build/$SLUG/verification_frames/$canvas" \
+                 "build/$SLUG/verification_frames/original-$canvas"
+            fi
+          done
+          for rebuilt in build/$SLUG/final*.mp4; do
+            python3 pipeline/export_verify.py "build/$SLUG" "$(basename "$rebuilt")" --frames
+          done
+
+      - name: Build revision-cache integrity manifest
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+          SOURCE_RUN: ${{ steps.target.outputs.source_run }}
+        run: python3 pipeline/revision_cache.py build "build/$SLUG" --run-id "$SOURCE_RUN"
+
+      - name: Upload selective-revision cache
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.target.outputs.slug }}-revision-cache
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            build/${{ steps.target.outputs.slug }}/clip_*.mp4
+            build/${{ steps.target.outputs.slug }}/seg_*.mp4
+            build/${{ steps.target.outputs.slug }}/youtube_seg_*.mp4
+            build/${{ steps.target.outputs.slug }}/*.mp3
+            build/${{ steps.target.outputs.slug }}/*.wav
+            build/${{ steps.target.outputs.slug }}/*.m4a
+            build/${{ steps.target.outputs.slug }}/*.png
+            build/${{ steps.target.outputs.slug }}/*.jpg
+            build/${{ steps.target.outputs.slug }}/*.jpeg
+            build/${{ steps.target.outputs.slug }}/*.webp
+            build/${{ steps.target.outputs.slug }}/*.npy
+            build/${{ steps.target.outputs.slug }}/words.json
+            build/${{ steps.target.outputs.slug }}/voiceover-manifest.json
+            build/${{ steps.target.outputs.slug }}/music_variants.json
+            build/${{ steps.target.outputs.slug }}/alts.json
+            build/${{ steps.target.outputs.slug }}/motion_report.json
+            build/${{ steps.target.outputs.slug }}/still_reference_report.json
+            build/${{ steps.target.outputs.slug }}/visual_symbol_report.json
+            build/${{ steps.target.outputs.slug }}/editorial.otio
+            build/${{ steps.target.outputs.slug }}/editorial_manifest.json
+            build/${{ steps.target.outputs.slug }}/editorial-verification.json
+            build/${{ steps.target.outputs.slug }}/locked-audio-manifest.json
+            build/${{ steps.target.outputs.slug }}/revision-cache-manifest.json
+
+      - name: Upload editorial verification package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.target.outputs.slug }}-editorial
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            build/${{ steps.target.outputs.slug }}/editorial.otio
+            build/${{ steps.target.outputs.slug }}/editorial_manifest.json
+            build/${{ steps.target.outputs.slug }}/editorial-verification.json
+            build/${{ steps.target.outputs.slug }}/locked-audio-manifest.json
+            build/${{ steps.target.outputs.slug }}/revision-cache-manifest.json
+            build/${{ steps.target.outputs.slug }}/export-verification*.json
+            build/${{ steps.target.outputs.slug }}/detected-scenes*.csv
+            build/${{ steps.target.outputs.slug }}/verification_frames/**
+
+      - name: Publish timeline and verification to permanent release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="video-$SLUG"
+          gh release view "$tag" >/dev/null
+          shopt -s nullglob
+          for file in \
+            "build/$SLUG/editorial.otio" \
+            "build/$SLUG/editorial_manifest.json" \
+            "build/$SLUG/editorial-verification.json" \
+            "build/$SLUG/locked-audio-manifest.json" \
+            "build/$SLUG/revision-cache-manifest.json" \
+            build/$SLUG/export-verification*.json \
+            build/$SLUG/detected-scenes*.csv; do
+            test -f "$file" && gh release upload "$tag" "$file" --clobber
+          done
+
+      - name: Commit compact editorial state
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f pipeline/.env
+          printf '%s\n' "$GITHUB_RUN_ID" > "build/$SLUG/revision-cache-run-id.txt"
+          git config user.name "editorial-bot"
+          git config user.email "editorial@users.noreply.github.com"
+          git add \
+            "build/$SLUG/revision-cache-run-id.txt" \
+            "build/$SLUG/editorial.otio" \
+            "build/$SLUG/editorial_manifest.json" \
+            "build/$SLUG/editorial-verification.json" \
+            "build/$SLUG/locked-audio-manifest.json" \
+            "build/$SLUG/revision-cache-manifest.json" \
+            "build/$SLUG"/export-verification*.json \
+            "build/$SLUG"/detected-scenes*.csv
+          git commit -m "editorial $SLUG: persist OTIO and revision cache pointer" || exit 0
+          for attempt in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || git rebase --abort || true
+            sleep $((attempt * 2))
+          done
+          exit 1

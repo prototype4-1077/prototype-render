@@ -1,0 +1,42 @@
+name: Record published video
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: "Build slug"
+        required: true
+      youtube_id:
+        description: "YouTube video id (watch?v=THIS)"
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: record-publish
+  cancel-in-progress: false
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Map slug to video id
+        run: python3 pipeline/learn.py published "${{ inputs.slug }}" "${{ inputs.youtube_id }}"
+
+      - name: Commit mapping
+        shell: bash
+        run: |
+          git config user.name "publish-bot"
+          git config user.email "publish@users.noreply.github.com"
+          git add pipeline/published_videos.json
+          git commit -m "publish: ${{ inputs.slug }} -> ${{ inputs.youtube_id }}" || echo "nothing to commit"
+          for i in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || true
+            sleep $((i * 2))
+          done
+          exit 1

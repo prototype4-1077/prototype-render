@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "profiles": {
+    "animated_tier1": {
+      "display_name": "Tier 1 Animated",
+      "quality_tier": 1,
+      "character_profile": null,
+      "description": "Premium cinematic symbolic animation for consciousness, perception, belief-analysis, identity, memory, emotion, and time videos.",
+      "max_still_source_ratio": 0.2,
+      "minimum_true_motion_ratio": 0.8,
+      "max_human_ratio": 0.45,
+      "max_family_run": 2,
+      "max_generic_human_run": 1,
+      "caption_policy": "minimal_keywords_only",
+      "source_priority": ["generated_temporal_video", "premium_animated_stock", "versioned_comfy_workflow", "enhanced_keyframes"],
+      "camera_language": "cinematic push-ins, slow orbits, motivated parallax, foreground-midground-background separation, and transitions caused by the ruling metaphor",
+      "design_language": "modern cinematic motion design, layered depth, elegant symbolic mechanisms, readable silhouettes, restrained typography, premium materials and lighting",
+      "prompt_suffix": "premium cinematic animation, sophisticated motion design, layered spatial depth, expressive material physics, elegant symbolic storytelling, coherent art direction, readable composition, smooth motivated camera movement, no template explainer graphics, no flat stock icons, no childish cartoon treatment, no random floating text, no slideshow zoom"
+    },
+    "june_oxley_animated_tier1": {
+      "display_name": "Tier 1 June Oxley Animated",
+      "quality_tier": 1,
+      "character_profile": "june_oxley",
+      "character_reference_id": "june_oxley_v1",
+      "description": "Premium stylized character animation for June Oxley's recurring small-town setting, with cinematic acting, country surrealism, humor, and grounded philosophical turns.",
+      "max_still_source_ratio": 0.2,
+      "minimum_true_motion_ratio": 0.8,
+      "max_human_ratio": 0.58,
+      "max_family_run": 3,
+      "max_generic_human_run": 1,
+      "caption_policy": "minimal_keywords_only",
+      "source_priority": ["consistent_character_temporal_video", "premium_stylized_animation", "versioned_character_workflow", "enhanced_keyframes"],
+      "camera_language": "cinematic porch-level coverage, expressive close-ups, subtle hat and hand acting, rocking-chair rhythm, warm tracking shots through a consistent small town, and seamless ordinary-to-surreal transitions",
+      "design_language": "high-end stylized rural character animation, tactile weathered materials, cinematic warm light, recurring town continuity, expressive but grounded acting, poetic country surrealism",
+      "prompt_suffix": "premium stylized cinematic animation, richly designed recurring rural small-town setting, tactile weathered materials, warm cinematic light, sophisticated camera motion, poetic country surrealism, consistent art direction, no cheap cartoon, no political imagery, no paragraph captions",
+      "character_prompt_suffix": "the same original June Oxley character, lean weathered elderly white rural man age 78 to 84, pale blue-gray eyes, short thinning white hair, trimmed white beard and mustache, deep smile lines, slightly crooked friendly grin, faded plaid or denim workwear, expressive grounded acting, no meme grandpa, no face drift"
+    },
+    "june_oxley_animated_standard": {
+      "display_name": "June Oxley Animated",
+      "quality_tier": 2,
+      "character_profile": "june_oxley",
+      "character_reference_id": "june_oxley_v1",
+      "description": "Polished recurring 2D/2.5D June Oxley animation for efficient series production without low-grade template aesthetics.",
+      "max_still_source_ratio": 0.3,
+      "minimum_true_motion_ratio": 0.7,
+      "max_human_ratio": 0.62,
+      "max_family_run": 3,
+      "max_generic_human_run": 1,
+      "caption_policy": "minimal_keywords_only",
+      "source_priority": ["consistent_character_animation", "polished_2_5d_animation", "animated_stock_with_character_inserts", "enhanced_keyframes"],
+      "camera_language": "clean medium shots, restrained push-ins and pans, clear character gestures, light background motion, and simple motivated transitions",
+      "design_language": "polished stylized 2D or 2.5D country storytelling, consistent character model, readable town locations, clean shapes, warm textures, expressive timing, and simple symbolic inserts",
+      "prompt_suffix": "polished stylized 2D or 2.5D country animation, warm recurring small-town setting, clean shapes, tactile textures, smooth restrained motion, readable composition, consistent art direction, no childish cartoon style, no low-grade template graphics, no paragraph captions",
+      "character_prompt_suffix": "the same original June Oxley character, lean weathered elderly white rural man age 78 to 84, pale blue-gray eyes, short thinning white hair, trimmed white beard and mustache, faded plaid or denim workwear, clean expressive poses, no generic stock-grandpa face, no face drift"
+    }
+  }
+}

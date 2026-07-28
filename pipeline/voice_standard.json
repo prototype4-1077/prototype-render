@@ -1,0 +1,44 @@
+{
+  "schema_version": 4,
+  "name": "Liam — Energetic Social Media Creator",
+  "runtime": {
+    "provider": "ElevenLabs",
+    "voice_id": "TX3LPaxmHKxFdv7VOQHJ",
+    "model_id": "eleven_v3",
+    "stability_mode": "creative",
+    "voice_settings": {
+      "stability": 0.0,
+      "similarity_boost": 0.75,
+      "style": 0.0,
+      "speed": 0.91
+    },
+    "audio_tags": {
+      "enabled": true,
+      "auto_fallback": true,
+      "scene_field": "audio_tags",
+      "rule": "Build a deliberate emotional arc with clear highs, quiet lows, natural shifts in intensity, selective laughter for genuine jokes, and neutral beats for contrast. Tags must never appear in visible text.",
+      "opening_rule": "Choose the first scene's delivery from the script's mood and message. It may begin with laughter, low voice, thoughtful reflection, sarcasm, curiosity, excitement, drama, mischievousness, a whisper, or neutral delivery. Never default every script to one opening tone."
+    }
+  },
+  "approved_performance_reference": {
+    "slug": "maybe-the-knob-isnt-broken",
+    "render_run_id": "29606656473",
+    "approved_at": "2026-07-18T01:35:11-04:00"
+  },
+  "reference_sha256": "40cf81e45fa4dba595be5fcf56ca3114cadf31be14444c4566e1c5a987eecc4d",
+  "reference_duration_seconds": 185.730563,
+  "reference_format": {
+    "codec": "mp3",
+    "sample_rate_hz": 44100,
+    "channels": 1,
+    "bit_rate_bps": 128000
+  },
+  "policy": {
+    "use_attached_voice_file_exactly_when_available": true,
+    "do_not_regenerate_or_clone_an_attached_approved_voiceover": true,
+    "naturalness_has_priority_over_speed_or_novelty": true,
+    "new_generation_minimum": "Equal or exceed the approved Maybe the Knob Isn't Broken performance for realism, emotional range, pacing, contrast, selective humor, and mood-appropriate opening delivery.",
+    "acceptable_replacement": "Only a demonstrably more natural, higher-fidelity recording approved by James.",
+    "final_mastering": "Preserve the supplied performance and timing. Limit processing to transparent cleanup, loudness control, and high-quality delivery encoding."
+  }
+}

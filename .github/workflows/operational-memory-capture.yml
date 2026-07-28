@@ -1,0 +1,70 @@
+name: Capture render operational memory
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "build/*/governor-summary.json"
+      - "build/*/render-status.json"
+      - "build/*/quality_report.json"
+      - "build/*/telemetry-summary.json"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: operational-memory-capture-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Identify completed render slugs
+        id: slugs
+        shell: bash
+        run: |
+          set -euo pipefail
+          slugs=""
+          while read -r file; do
+            case "$file" in
+              build/*/governor-summary.json|build/*/render-status.json|build/*/quality_report.json|build/*/telemetry-summary.json)
+                slug="${file#build/}"; slug="${slug%%/*}"
+                case " $slugs " in *" $slug "*) ;; *) slugs="$slugs $slug" ;; esac
+                ;;
+            esac
+          done < <(git diff-tree --no-commit-id --name-only --diff-filter=AM -r "$GITHUB_SHA")
+          echo "slugs=$(echo "$slugs" | xargs)" >> "$GITHUB_OUTPUT"
+
+      - name: Record immutable run, warning, and telemetry occurrences
+        if: steps.slugs.outputs.slugs != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          for slug in ${{ steps.slugs.outputs.slugs }}; do
+            run_id=""
+            [ -f "build/$slug/run-id.txt" ] && run_id="$(cat "build/$slug/run-id.txt")"
+            python3 pipeline/record_operational_run.py "build/$slug" \
+              --github-run-id "$run_id" --commit-sha "$GITHUB_SHA"
+          done
+
+      - name: Commit occurrence records
+        if: steps.slugs.outputs.slugs != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "operational-memory-bot"
+          git config user.email "operational-memory@users.noreply.github.com"
+          git add pipeline/operational_memory/occurrences
+          git commit -m "operational-memory: capture ${{ steps.slugs.outputs.slugs }}" || exit 0
+          for i in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || { git rebase --abort || true; }
+            sleep $((i * 2))
+          done
+          echo "unable to persist operational occurrence" >&2
+          exit 1

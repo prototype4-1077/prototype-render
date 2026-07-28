@@ -1,0 +1,87 @@
+name: Refresh YouTube audience statistics
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "23 13 * * *"
+  push:
+    branches: [main]
+    paths:
+      - "pipeline/yt_published_result.json"
+      - "pipeline/published_videos.json"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: youtube-stats-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Refresh public performance snapshots
+        id: refresh
+        continue-on-error: true
+        env:
+          YT_API_KEY: ${{ secrets.YT_API_KEY }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 pipeline/yt_stats_refresh.py | tee /tmp/youtube-stats-refresh.txt
+
+      - name: Validate and summarize refresh status
+        if: always()
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          status = json.load(open('pipeline/youtube_stats_status.json', encoding='utf-8'))
+          print(json.dumps(status, indent=2, ensure_ascii=False))
+          if status.get('status') != 'success':
+              print('::warning title=YouTube statistics unavailable::' + str(status.get('required_action') or status.get('error')))
+          else:
+              print(f"updated {status.get('updated_count', 0)} YouTube snapshots")
+          PY
+
+      - name: Commit status and age-normalized snapshots
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "youtube-stats-bot"
+          git config user.email "youtube-stats@users.noreply.github.com"
+          git add pipeline/youtube_stats_status.json 2>/dev/null || true
+          git add build/*/yt_stats.json 2>/dev/null || true
+          git commit -m "analytics: refresh YouTube public statistics" || exit 0
+          for i in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || { git rebase --abort || true; }
+            sleep $((i * 2))
+          done
+          echo "statistics refresh completed but evidence could not be persisted" >&2
+          exit 1
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: youtube-stats-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: warn
+          path: |
+            /tmp/youtube-stats-refresh.txt
+            pipeline/youtube_stats_status.json
+            build/*/yt_stats.json

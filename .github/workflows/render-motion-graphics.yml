@@ -1,0 +1,284 @@
+name: Render premium motion-graphics video
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "build/**/mograph.request"
+
+permissions:
+  contents: write
+
+jobs:
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      slug: ${{ steps.slug.outputs.slug }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+      - id: slug
+        shell: bash
+        run: |
+          file="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" | grep -E '^build/[^/]+/mograph\.request$' | head -n 1)"
+          test -n "$file"
+          slug="${file#build/}"
+          slug="${slug%/mograph.request}"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+
+  render:
+    needs: detect
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    concurrency:
+      group: motion-graphics-${{ needs.detect.outputs.slug }}
+      cancel-in-progress: false
+    env:
+      SLUG: ${{ needs.detect.outputs.slug }}
+      BD: build/${{ needs.detect.outputs.slug }}
+      PYTHONUNBUFFERED: "1"
+      WHISPER_MODEL: base
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Restore premium motion-graphics renderer
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64
+          import pathlib
+          import py_compile
+
+          parts = sorted(pathlib.Path("pipeline").glob("motion_graphics.py.b64.part*"))
+          if not parts:
+              raise SystemExit("motion-graphics renderer payload is missing")
+          encoded = "".join(path.read_text(encoding="ascii").strip() for path in parts)
+          target = pathlib.Path("pipeline/motion_graphics.py")
+          target.write_bytes(base64.b64decode(encoded, validate=True))
+          py_compile.compile(str(target), doraise=True)
+          print(f"restored {target}: {target.stat().st_size} bytes from {len(parts)} part(s)")
+          PY
+
+      - name: Restore and checksum the exact attached voice
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import base64
+          import hashlib
+          import json
+          import pathlib
+
+          bd = pathlib.Path("build") / "${{ needs.detect.outputs.slug }}"
+          script = json.loads((bd / "script.json").read_text(encoding="utf-8"))
+          expected = script.get("voice_source") or {}
+          parts = sorted(bd.glob("vo.mp3.b64.part*"))
+          if not parts:
+              raise SystemExit("exact voice payload is missing")
+          encoded = "".join(path.read_text(encoding="ascii").strip() for path in parts)
+          raw = base64.b64decode(encoded, validate=True)
+          digest = hashlib.sha256(raw).hexdigest()
+          if len(raw) != int(expected.get("bytes") or 0):
+              raise SystemExit(f"voice byte count mismatch: {len(raw)}")
+          if digest != expected.get("sha256"):
+              raise SystemExit(f"voice checksum mismatch: {digest}")
+          target = bd / "vo.mp3"
+          target.write_bytes(raw)
+          print(f"exact voice restored: {len(raw)} bytes sha256={digest}")
+          PY
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            /tmp/models
+          key: mograph-models-v1
+
+      - name: System dependencies
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+
+      - name: Python dependencies
+        run: pip install -q -r pipeline/requirements.txt
+
+      - name: Validate voice duration and pipeline tests
+        shell: bash
+        run: |
+          duration="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$BD/vo.mp3")"
+          python3 - "$duration" <<'PY'
+          import json, os, pathlib, sys
+          duration = float(sys.argv[1])
+          script = json.loads((pathlib.Path(os.environ["BD"]) / "script.json").read_text(encoding="utf-8"))
+          expected = float((script.get("voice_source") or {}).get("duration_seconds") or 0)
+          if abs(duration - expected) > 0.08:
+              raise SystemExit(f"voice duration mismatch: {duration:.3f}s vs {expected:.3f}s")
+          print(f"exact voice duration verified: {duration:.3f}s")
+          PY
+          python3 -c 'import sys; sys.path.insert(0,"pipeline"); import build; build.ensure_fonts()'
+          python3 -m unittest discover -s pipeline/tests -v
+
+      - name: Word-sync and align the exact narration
+        shell: bash
+        run: |
+          rm -f "$BD/words.json"
+          python3 pipeline/transcribe.py "$BD"
+          python3 - <<'PY'
+          import json, os, pathlib
+          path = pathlib.Path(os.environ["BD"]) / "script.json"
+          script = json.loads(path.read_text(encoding="utf-8"))
+          for scene in script["scenes"]:
+              scene.pop("start", None)
+              scene.pop("duration", None)
+              scene.pop("kw_times", None)
+          path.write_text(json.dumps(script, indent=1, ensure_ascii=False), encoding="utf-8")
+          PY
+          python3 pipeline/align.py "$BD"
+
+      - name: Render every scene as genuine animated graphics
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import subprocess
+          import sys
+
+          bd = pathlib.Path(os.environ["BD"])
+          script = json.loads((bd / "script.json").read_text(encoding="utf-8"))
+          for index, scene in enumerate(script["scenes"]):
+              print(f"rendering motion graphic {index + 1}/{len(script['scenes'])}: {scene['graphics_template']}", flush=True)
+              subprocess.run([sys.executable, "pipeline/motion_graphics.py", str(bd), str(index)], check=True)
+          PY
+          python3 pipeline/motion.py report "$BD"
+          python3 pipeline/motion.py validate "$BD"
+          python3 - <<'PY'
+          import json, os, pathlib
+          bd = pathlib.Path(os.environ["BD"])
+          report = json.loads((bd / "motion_graphics_report.json").read_text())
+          script = json.loads((bd / "script.json").read_text())
+          if len(report.get("scenes", {})) != len(script["scenes"]):
+              raise SystemExit("not every scene has a motion-graphics audit record")
+          failures = [i for i, row in report["scenes"].items() if not row["temporal_evidence"].get("passes")]
+          if failures:
+              raise SystemExit("temporal motion failed for scenes: " + ", ".join(failures))
+          print(f"motion audit passed for all {len(script['scenes'])} scenes")
+          PY
+
+      - name: Create captions, Social Weather title, and overlays
+        run: python3 pipeline/prep.py "$BD"
+
+      - name: Render portrait and native YouTube scenes
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess, sys
+          bd = pathlib.Path(os.environ["BD"])
+          count = len(json.loads((bd / "script.json").read_text())["scenes"])
+          for index in range(count):
+              subprocess.run([sys.executable, "pipeline/assemble.py", str(bd), "scene", str(index)], check=True)
+              subprocess.run([sys.executable, "pipeline/assemble.py", str(bd), "youtube-scene", str(index)], check=True)
+          PY
+
+      - name: Assemble with the exact voice and no music processing
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, pathlib, subprocess
+          bd = pathlib.Path(os.environ["BD"])
+          script = json.loads((bd / "script.json").read_text(encoding="utf-8"))
+          count = len(script["scenes"])
+
+          def finish(prefix, final_name):
+              list_path = bd / f"{prefix or 'portrait'}-concat.txt"
+              with list_path.open("w", encoding="utf-8") as handle:
+                  for index in range(count):
+                      handle.write(f"file '{(bd / f'{prefix}seg_{index:02d}.mp4').resolve()}'\n")
+              silent = bd / f"{prefix or 'portrait'}-silent.mp4"
+              subprocess.run([
+                  "ffmpeg", "-v", "error", "-y", "-f", "concat", "-safe", "0",
+                  "-i", str(list_path), "-c", "copy", str(silent),
+              ], check=True)
+              final = bd / final_name
+              subprocess.run([
+                  "ffmpeg", "-v", "error", "-y", "-i", str(silent), "-i", str(bd / "vo.mp3"),
+                  "-map", "0:v:0", "-map", "1:a:0", "-c:v", "copy", "-c:a", "aac",
+                  "-b:a", "320k", "-shortest", "-movflags", "+faststart", str(final),
+              ], check=True)
+              return final
+
+          portrait = finish("", "final.mp4")
+          youtube = finish("youtube_", "final_youtube.mp4")
+          manifest = {
+              "delivery": {
+                  "index": 1,
+                  "label": "Exact Attached Voice — No Music",
+                  "portrait_video": portrait.name,
+                  "youtube_video": youtube.name,
+                  "other_choices": "not generated for this voice-critical cut",
+              },
+              "voice": script["voice_source"],
+              "mix": "direct narration map; no gain, compression, EQ, limiter, speed change, or music",
+          }
+          (bd / "music_variants.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+          (bd / "CREDITS.txt").write_text(
+              "Visuals: original procedural motion graphics rendered by the TikTok Video Pipeline.\n"
+              "Voice: user-supplied ElevenLabs Liam attachment; checksum recorded in script.json.\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Independent quality gate
+        run: python3 pipeline/quality_gate.py "$BD"
+
+      - name: Upload final motion-graphics video
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ needs.detect.outputs.slug }}
+          retention-days: 90
+          path: |
+            ${{ env.BD }}/final.mp4
+            ${{ env.BD }}/final_youtube.mp4
+            ${{ env.BD }}/quality_report.json
+            ${{ env.BD }}/motion_report.json
+            ${{ env.BD }}/motion_graphics_report.json
+            ${{ env.BD }}/visual_symbol_report.json
+            ${{ env.BD }}/music_variants.json
+            ${{ env.BD }}/CREDITS.txt
+
+      - name: Publish permanent release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          TAG="video-${SLUG}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "Social Weather: Voice Memo Guy — Motion Graphics" \
+              --notes "Exact-voice premium motion-graphics render from run $GITHUB_RUN_ID. Not approved; review cut."
+          gh release upload "$TAG" "$BD/final.mp4#${SLUG}.mp4" --clobber
+          gh release upload "$TAG" "$BD/final_youtube.mp4#${SLUG}-youtube.mp4" --clobber
+          gh release upload "$TAG" "$BD/quality_report.json" --clobber
+          gh release upload "$TAG" "$BD/motion_graphics_report.json" --clobber
+
+      - name: Commit timing and audit metadata only
+        if: always()
+        shell: bash
+        run: |
+          printf '%s\n' "$GITHUB_RUN_ID" > "$BD/run-id.txt"
+          git config user.name "motion-graphics-render-bot"
+          git config user.email "render@users.noreply.github.com"
+          for f in "$BD/script.json" "$BD/run-id.txt" "$BD/quality_report.json" "$BD/motion_report.json" "$BD/motion_graphics_report.json" "$BD/music_variants.json"; do
+            git add "$f" 2>/dev/null || true
+          done
+          git commit -m "render $SLUG: motion-graphics review cut" || true
+          for attempt in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || git rebase --abort || true
+            sleep $((attempt * 2))
+          done
+          exit 1

@@ -1,0 +1,133 @@
+name: Expand Think Tank submission
+
+# The Think Tank (GPT) commits ONE small file: build/<slug>/submission.json
+# This expands it into a full pipeline package, validates it, and drops
+# render.request so the guarded render workflow fires. GPT never has to write
+# a large script.json through its Action.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "build/**/submission.json"
+  # No-encoding path: POST /repos/.../dispatches with
+  #   {"event_type":"submission","client_payload":{"slug":"my-slug","submission":{...}}}
+  # The submission is plain JSON - no Base64, no file write by the caller.
+  repository_dispatch:
+    types: [submission]
+
+permissions:
+  contents: write
+  actions: write   # required to dispatch render.yml
+
+concurrency:
+  group: submission-expand-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  expand:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Materialize dispatched submission
+        if: github.event_name == 'repository_dispatch'
+        shell: bash
+        env:
+          PAYLOAD: ${{ toJSON(github.event.client_payload) }}
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, pathlib, re
+          payload = json.loads(os.environ["PAYLOAD"])
+          submission = payload.get("submission") or payload
+          slug = payload.get("slug") or submission.get("slug") or submission.get("title") or ""
+          slug = re.sub(r"[^a-z0-9]+", "-", str(slug).lower()).strip("-")
+          if not slug:
+              raise SystemExit("dispatch payload needs a slug or title")
+          submission.pop("slug", None)
+          out = pathlib.Path("build") / slug
+          out.mkdir(parents=True, exist_ok=True)
+          (out / "submission.json").write_text(
+              json.dumps(submission, indent=1, ensure_ascii=False) + "\n", encoding="utf-8")
+          print(f"wrote build/{slug}/submission.json "
+                f"({len(submission.get('scenes') or [])} scenes)")
+          PY
+
+      - name: Identify submitted slug(s)
+        id: slugs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.event_name }}" = "repository_dispatch" ]; then
+            files="$(find build -name submission.json -newer .git/HEAD 2>/dev/null || true)"
+            [ -z "$files" ] && files="$(git status --porcelain --untracked-files=all build | awk '{print $2}' | grep 'submission.json$' || true)"
+          else
+            files="$(git diff --name-only HEAD^ HEAD -- 'build/*/submission.json' || true)"
+            [ -z "$files" ] && files="$(git ls-files 'build/*/submission.json')"
+          fi
+          slugs=""
+          for f in $files; do
+            s="${f#build/}"; s="${s%/submission.json}"
+            if [ "${{ github.event_name }}" != "repository_dispatch" ]; then
+              [ -f "build/$s/script.json" ] && [ -f "build/$s/render-started.txt" ] && continue
+            fi
+            slugs="$slugs $s"
+          done
+          echo "slugs=$(echo "$slugs" | xargs)" >> "$GITHUB_OUTPUT"
+          echo "found: $slugs"
+
+      - name: Expand, validate, and request render
+        id: expand
+        if: steps.slugs.outputs.slugs != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          ready=""
+          git config user.name "submission-bot"
+          git config user.email "submission@users.noreply.github.com"
+          for slug in ${{ steps.slugs.outputs.slugs }}; do
+            echo "::group::$slug"
+            python3 pipeline/expand_submission.py "$slug"
+            if python3 pipeline/preflight.py "build/$slug" --fix-safe --record; then
+              # lock the exact package so render.yml can verify what it renders
+              python3 pipeline/package_integrity.py snapshot "build/$slug" \
+                --output "build/$slug/package-fingerprint.json"
+              printf 'go\n' > "build/$slug/render.request"
+              git add -f "build/$slug"
+              ready="$ready $slug"
+              echo "$slug ready"
+            else
+              echo "preflight blocked $slug" > "build/$slug/expand-blocked.txt"
+              git add -f "build/$slug/expand-blocked.txt" "build/$slug" || true
+            fi
+            echo "::endgroup::"
+          done
+          echo "ready=$(echo "$ready" | xargs)" >> "$GITHUB_OUTPUT"
+          git commit -m "submission: expand + request render for ${{ steps.slugs.outputs.slugs }}" || true
+          for i in 1 2 3 4 5; do
+            git push && break
+            git pull --rebase --autostash origin main || { git rebase --abort || true; }
+            sleep $((i * 2))
+          done
+
+      - name: Dispatch render for each expanded package
+        if: steps.expand.outputs.ready != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A commit made with GITHUB_TOKEN does not trigger render-request.yml
+          # (GitHub blocks workflow-triggered workflow runs), so dispatch directly.
+          for slug in ${{ steps.expand.outputs.ready }}; do
+            fingerprint="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["fingerprint"])' "build/$slug/package-fingerprint.json")"
+            echo "dispatching render.yml for $slug package=$fingerprint"
+            gh workflow run render.yml \
+              -f slug="$slug" \
+              -f long_render=true \
+              -f package_fingerprint="$fingerprint"
+          done

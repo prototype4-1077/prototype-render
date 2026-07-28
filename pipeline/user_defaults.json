@@ -1,0 +1,50 @@
+{
+  "schema_version": 2,
+  "updated_utc": "2026-07-17",
+  "default_video_workflow": "TikTok Video Pipeline",
+  "voice_standard": {
+    "provider": "ElevenLabs",
+    "voice": "Liam - Energetic, Social Media Creator",
+    "voice_id": "TX3LPaxmHKxFdv7VOQHJ",
+    "model_id": "eleven_v3",
+    "stability_mode": "creative",
+    "creativity": "maximum",
+    "reference_sha256": "40cf81e45fa4dba595be5fcf56ca3114cadf31be14444c4566e1c5a987eecc4d",
+    "reference_duration_seconds": 185.730563,
+    "reference_source": "ElevenLabs_2026-07-15T10_31_56_Liam - Energetic, Social Media Creator_pre_sp91_s31_sb75_v3.mp3",
+    "settings": {
+      "speed": 0.91,
+      "stability": 0.0,
+      "similarity_boost": 0.75,
+      "style": 0.0
+    },
+    "audio_tags": {
+      "enabled": true,
+      "script_field": "audio_tags",
+      "auto_fallback": true,
+      "recommended": [
+        "curious",
+        "excited",
+        "whispers",
+        "sighs",
+        "sarcastic",
+        "mischievously"
+      ],
+      "policy": "Use zero or one intentional vocal-delivery tag per scene. Keep most beats neutral, preserve narration text exactly, and never auto-add environmental or impact sound effects."
+    },
+    "acceptance_rule": "Use the supplied reference recording unchanged when it matches the approved script. Any newly generated narration must equal or exceed this reference for natural human prosody, emotional variation, pacing, intelligibility, and realism. Reject robotic cadence, flattened emphasis, metallic artifacts, excessive compression, synthetic-sounding pauses, or tags that overpower the words."
+  },
+  "visual_standard": {
+    "acceptance_rule": "Every scene must visibly prove the spoken line's semantic anchor and primary symbol. A mood-only, loosely related, or keyword-adjacent image is a failure even when it looks cinematic.",
+    "required_alignment": [
+      "spoken line",
+      "semantic anchor",
+      "primary symbol",
+      "visual function"
+    ],
+    "selection_test": "A reviewer should be able to explain, from the frame alone, how the depicted mechanism or symbol demonstrates the narration.",
+    "fallback_rule": "Prefer bespoke deterministic, generated, or explicitly constructed symbolic visuals over unrelated stock footage. Never accept provider-title or broad-topic similarity as proof of semantic fit.",
+    "continuity_rule": "The symbol named by the scene plan must be unmistakably present, correctly framed, readable on a phone, and active in the requested action or transformation."
+  },
+  "default_music": "Deep Current"
+}

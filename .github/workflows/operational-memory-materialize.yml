@@ -1,0 +1,65 @@
+name: Materialize operational memory index
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pipeline/operational_memory/occurrences/*.json"
+      - "pipeline/operational_memory/solutions.json"
+      - "pipeline/operational_memory/prevention_rules.json"
+  workflow_dispatch:
+  schedule:
+    - cron: "17 11 * * 1"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: operational-memory-index-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rebuild:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Rebuild causal incident, solution, and action views
+        run: python3 pipeline/operational_memory_analysis.py
+
+      - name: Validate operational memory
+        run: |
+          python3 -m py_compile \
+            pipeline/operational_memory.py \
+            pipeline/operational_memory_analysis.py \
+            pipeline/record_operational_run.py \
+            pipeline/preflight.py \
+            pipeline/package_integrity.py
+          python3 -m unittest pipeline.tests.test_operational_memory -v
+
+      - name: Commit compact index and action queue
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "operational-memory-bot"
+          git config user.email "operational-memory@users.noreply.github.com"
+          git add \
+            pipeline/operational_memory/incidents.json \
+            pipeline/operational_memory/index.json \
+            pipeline/operational_memory/action_queue.json
+          git commit -m "operational-memory: rebuild incident index and actions" || exit 0
+          for i in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || { git rebase --abort || true; }
+            python3 pipeline/operational_memory_analysis.py
+            git add \
+              pipeline/operational_memory/incidents.json \
+              pipeline/operational_memory/index.json \
+              pipeline/operational_memory/action_queue.json
+            git commit -m "operational-memory: rebuild incident index and actions" || true
+            sleep $((i * 2))
+          done
+          echo "unable to update operational memory index" >&2
+          exit 1

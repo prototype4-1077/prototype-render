@@ -1,0 +1,85 @@
+name: Intelligence stack integrity
+
+on:
+  pull_request:
+    paths:
+      - "intelligence_stack/**"
+      - "pipeline/visual_risk.py"
+      - ".github/workflows/intelligence-stack-ci.yml"
+  push:
+    branches: [main]
+    paths:
+      - "intelligence_stack/**"
+      - "pipeline/visual_risk.py"
+      - ".github/workflows/intelligence-stack-ci.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+
+      - name: Validate Python and JSON
+        run: |
+          python3 -m py_compile \
+            pipeline/visual_risk.py \
+            intelligence_stack/reach/collect.py \
+            intelligence_stack/promptfoo/provider.py \
+            intelligence_stack/promptfoo/assertions.py \
+            intelligence_stack/comfy/render.py \
+            intelligence_stack/fiftyone/export_visual_memory.py
+          python3 - <<'PY'
+          import glob, json
+          paths = glob.glob('intelligence_stack/**/*.json', recursive=True)
+          for path in paths:
+              with open(path, encoding='utf-8') as handle:
+                  json.load(handle)
+              print('valid', path)
+          PY
+
+      - name: Run stack regression tests
+        run: python3 -m unittest intelligence_stack.tests.test_stack -v
+
+      - name: Exercise signal normalization
+        run: |
+          python3 intelligence_stack/reach/collect.py \
+            --ingest intelligence_stack/reach/fixtures/sample.jsonl \
+            --out-dir /tmp/external-signals
+          python3 - <<'PY'
+          import json
+          payload = json.load(open('/tmp/external-signals/LATEST.json', encoding='utf-8'))
+          assert payload['record_count'] == 2, payload
+          assert all(record['claim_status'] == 'unverified' for record in payload['records'])
+          assert all(record['rights_status'] == 'reference_only' for record in payload['records'])
+          print('signal fixture passed')
+          PY
+
+      - name: Resolve constrained ComfyUI workflow
+        run: |
+          python3 intelligence_stack/comfy/render.py \
+            intelligence_stack/comfy/examples/prosthetic_shadow.json \
+            --workflow-out /tmp/prosthetic-shadow.workflow.json \
+            --dry-run
+
+      - name: Run Promptfoo lower-model gate
+        env:
+          PROMPTFOO_DISABLE_TELEMETRY: "1"
+          PROMPTFOO_PYTHON: python3
+        run: |
+          npx --yes promptfoo@0.121.19 eval \
+            -c intelligence_stack/promptfoo/promptfooconfig.yaml \
+            --no-cache \
+            --output /tmp/promptfoo-results.json

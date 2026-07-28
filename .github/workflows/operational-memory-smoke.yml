@@ -1,0 +1,18 @@
+name: Operational memory smoke fixture
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exercise causal materialization, package integrity, and preflight CLI
+        run: |
+          python3 pipeline/operational_memory_analysis.py
+          python3 pipeline/package_integrity.py show build/who-wrote-the-menu
+          python3 pipeline/preflight.py build/who-wrote-the-menu --json

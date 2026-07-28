@@ -1,0 +1,369 @@
+name: Render video
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: "Build slug (expects build/<slug>/script.json in the repo; optional vo.mp3 next to it)"
+        required: true
+      package_fingerprint:
+        description: "Exact preflighted package fingerprint; blank direct dispatch runs read-only preflight"
+        required: false
+        default: ""
+      long_render:
+        description: "Allow the full 78-minute Governor budget (default is a 45-minute wallet)"
+        type: boolean
+        required: false
+        default: false
+      use_container:
+        description: "Run inside the prebuilt ghcr render image (package must be public)"
+        type: boolean
+        required: false
+        default: false
+  workflow_call:
+    inputs:
+      slug:
+        type: string
+        required: true
+      package_fingerprint:
+        type: string
+        required: false
+        default: ""
+      long_render:
+        type: boolean
+        required: false
+        default: false
+      use_container:
+        type: boolean
+        required: false
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: render-${{ inputs.slug }}
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    container: ${{ inputs.use_container && 'ghcr.io/1974jwatson/tiktok-render:latest' || '' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify exact preflighted package
+        shell: bash
+        run: |
+          set -euo pipefail
+          expected="${{ inputs.package_fingerprint }}"
+          if [[ -n "$expected" ]]; then
+            python3 pipeline/package_integrity.py verify "build/${{ inputs.slug }}" --expected "$expected"
+          else
+            echo "::warning::Direct render dispatch omitted a package fingerprint; running read-only preflight in the render job."
+            python3 pipeline/preflight.py "build/${{ inputs.slug }}"
+          fi
+
+      - name: Restore connector-uploaded voiceover
+        shell: bash
+        run: |
+          shopt -s nullglob
+          parts=(build/${{ inputs.slug }}/vo.mp3.b64.part*)
+          if ((${#parts[@]})); then
+            cat "${parts[@]}" | base64 --decode > "build/${{ inputs.slug }}/vo.mp3"
+          fi
+
+      - name: Restore connector-uploaded visual assets
+        shell: bash
+        run: |
+          shopt -s nullglob
+          for encoded in build/${{ inputs.slug }}/*.b64; do
+            target="${encoded%.b64}"
+            base64 --decode "$encoded" > "$target"
+          done
+
+      - if: ${{ !inputs.use_container }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cache models (whisper, CLIP, depth)
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            /tmp/clipcache
+            /tmp/models
+          key: models-v1
+
+      - name: System deps
+        if: ${{ !inputs.use_container }}
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+
+      - name: Validate supplied media and preserve long-script intent
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          import pathlib
+          import subprocess
+
+          build = pathlib.Path("build/${{ inputs.slug }}")
+          script_path = build / "script.json"
+          voice_path = build / "vo.mp3"
+          script = json.loads(script_path.read_text(encoding="utf-8"))
+          scenes = script.get("scenes") or []
+          connector_parts = sorted(build.glob("vo.mp3.b64.part*"))
+          supplied_script = bool(script.get("user_vo") or connector_parts)
+          changed = False
+
+          if supplied_script:
+              duration = 0.0
+              size_bytes = voice_path.stat().st_size if voice_path.exists() else 0
+              if size_bytes > 0:
+                  try:
+                      probe = subprocess.run(
+                          [
+                              "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                              "-of", "default=noprint_wrappers=1:nokey=1", str(voice_path),
+                          ],
+                          check=True,
+                          capture_output=True,
+                          text=True,
+                      )
+                      duration = float(probe.stdout.strip() or 0)
+                  except Exception:
+                      duration = 0.0
+
+              complete = duration >= 60.0 and size_bytes >= 1_000_000
+              script["user_vo"] = True
+              if not complete:
+                  voice_path.unlink(missing_ok=True)
+                  settings = script.setdefault("voice_settings", {})
+                  settings.update({
+                      "stability": 0.31,
+                      "similarity_boost": 0.75,
+                      "style": 0.35,
+                      "speed": 0.91,
+                  })
+                  changed = True
+                  print(
+                      f"Voiceover incomplete ({duration:.2f}s, {size_bytes} bytes); "
+                      "preserved supplied script and recovered with matching Liam settings."
+                  )
+              else:
+                  changed = True
+                  print(f"Connector voiceover validated at {duration:.2f}s and {size_bytes} bytes.")
+
+          policy = script.get("visual_policy")
+          if len(scenes) > 26:
+              if isinstance(policy, dict):
+                  policy.setdefault("mode", "diverse_symbols")
+                  current = float(policy.get("max_human_ratio") or 0.0)
+                  if current < 0.60:
+                      policy["max_human_ratio"] = 0.60
+                      changed = True
+              elif policy in {"diverse_symbols", "strict", "enforce"}:
+                  script["visual_policy"] = {
+                      "mode": policy,
+                      "max_human_ratio": 0.60,
+                  }
+                  changed = True
+              print("Applied long-script visual policy: max human presence 60%.")
+
+          if changed:
+              script_path.write_text(
+                  json.dumps(script, ensure_ascii=False, separators=(",", ":")),
+                  encoding="utf-8",
+              )
+          PY
+
+      - name: Python deps
+        if: ${{ !inputs.use_container }}
+        run: pip install -q -r pipeline/requirements.txt
+
+      - name: Pipeline regression tests
+        run: python3 -m unittest discover -s pipeline/tests -v
+
+      - name: Cache previously downloaded footage for this slug
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/${{ inputs.slug }}/clip_*.mp4
+            build/${{ inputs.slug }}/vo.mp3
+            build/${{ inputs.slug }}/words.json
+          key: footage-v2-${{ inputs.slug }}-${{ github.run_id }}
+          restore-keys: |
+            footage-v2-${{ inputs.slug }}-
+
+      - name: API keys from repo secrets
+        run: |
+          printf 'ELEVENLABS_API_KEY=%s\nPEXELS_API_KEY=%s\nELEVENLABS_VOICE_ID=%s\n' \
+            "${{ secrets.ELEVENLABS_API_KEY }}" "${{ secrets.PEXELS_API_KEY }}" \
+            "${{ secrets.ELEVENLABS_VOICE_ID || 'TX3LPaxmHKxFdv7VOQHJ' }}" > pipeline/.env
+
+      - name: Build under adaptive Governor
+        env:
+          SEMANTIC_CLIP: "1"
+          GOVERNOR_MODE: "recover"
+          BUILD_PASS_BUDGET: "3600"
+          TRANSCRIBE_CHUNK_SECONDS: "100000"
+          GOVERNOR_CONSOLE_HEARTBEATS: "1"
+          GOVERNOR_HEARTBEAT_SECONDS: "15"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python3 pipeline/run_governed.py "build/${{ inputs.slug }}" \
+            --max-passes 200 --overall-timeout ${{ inputs.long_render && '4680' || '2700' }}
+          python3 - "build/${{ inputs.slug }}/script.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "pipeline")
+          import render_policy
+
+          script = json.load(open(sys.argv[1], encoding="utf-8"))
+          build_dir = os.path.dirname(sys.argv[1])
+          missing = [
+              name for name in render_policy.required_video_names(script)
+              if not os.path.exists(os.path.join(build_dir, name))
+          ]
+          if missing:
+              raise SystemExit("missing requested output(s): " + ", ".join(missing))
+          PY
+
+      - name: Cut-coherence report (informational)
+        if: always()
+        run: python3 pipeline/coherence.py "build/${{ inputs.slug }}" || true
+
+      - name: Build cross-run operational review
+        if: always()
+        run: |
+          python3 pipeline/governor_report.py --repo-root . --json \
+            --output "build/${{ inputs.slug }}/governor-review.json" || true
+
+      - name: Upload Governor diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.slug }}-governor-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 30
+          path: |
+            build/${{ inputs.slug }}/governor/**
+            build/${{ inputs.slug }}/governor-summary.json
+            build/${{ inputs.slug }}/governor-review.json
+            build/${{ inputs.slug }}/render-status.json
+            build/${{ inputs.slug }}/quality_report.json
+            build/${{ inputs.slug }}/preflight-report.json
+            build/${{ inputs.slug }}/package-fingerprint.json
+            build/${{ inputs.slug }}/narrative_fidelity_report.json
+
+      - name: Upload final video
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.slug }}
+          path: |
+            build/${{ inputs.slug }}/final*.mp4
+            build/${{ inputs.slug }}/alts_sheet.jpg
+            build/${{ inputs.slug }}/motion_report.json
+            build/${{ inputs.slug }}/motion_report_short.json
+            build/${{ inputs.slug }}/visual_symbol_report.json
+            build/${{ inputs.slug }}/narrative_fidelity_report.json
+            build/${{ inputs.slug }}/still_reference_report.json
+            build/${{ inputs.slug }}/music_variants.json
+            build/${{ inputs.slug }}/coherence_report.json
+            build/${{ inputs.slug }}/scene-review.html
+            build/${{ inputs.slug }}/scene-review.json
+            build/${{ inputs.slug }}/CREDITS.txt
+
+      - name: Publish permanent Release (artifacts expire after 90 days)
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          TAG="video-${{ inputs.slug }}"
+          gh release view "$TAG" >/dev/null 2>&1 || \
+            gh release create "$TAG" --title "${{ inputs.slug }}" \
+              --notes "Rendered $(date -u +%F) by run ${{ github.run_id }}"
+          shopt -s nullglob
+          videos=(build/${{ inputs.slug }}/final*.mp4)
+          test "${#videos[@]}" -ge 1
+          for video in "${videos[@]}"; do
+            gh release upload "$TAG" "$video" --clobber
+          done
+          test -f "build/${{ inputs.slug }}/alts_sheet.jpg" && gh release upload "$TAG" \
+            "build/${{ inputs.slug }}/alts_sheet.jpg" --clobber || true
+          test -f "build/${{ inputs.slug }}/CREDITS.txt" && gh release upload "$TAG" \
+            "build/${{ inputs.slug }}/CREDITS.txt" --clobber || true
+          test -f "build/${{ inputs.slug }}/visual_symbol_report.json" && gh release upload "$TAG" \
+            "build/${{ inputs.slug }}/visual_symbol_report.json" --clobber || true
+          test -f "build/${{ inputs.slug }}/narrative_fidelity_report.json" && gh release upload "$TAG" \
+            "build/${{ inputs.slug }}/narrative_fidelity_report.json" --clobber || true
+          test -f "build/${{ inputs.slug }}/still_reference_report.json" && gh release upload "$TAG" \
+            "build/${{ inputs.slug }}/still_reference_report.json" --clobber || true
+          test -f "build/${{ inputs.slug }}/music_variants.json" && gh release upload "$TAG" \
+            "build/${{ inputs.slug }}/music_variants.json" --clobber || true
+          test -f "build/${{ inputs.slug }}/scene-review.html" && gh release upload "$TAG" \
+            "build/${{ inputs.slug }}/scene-review.html#${{ inputs.slug }}-scene-review.html" --clobber || true
+          test -f "build/${{ inputs.slug }}/scene-review.json" && gh release upload "$TAG" \
+            "build/${{ inputs.slug }}/scene-review.json#${{ inputs.slug }}-scene-review.json" --clobber || true
+
+      - name: Commit outcome, memory, and compact Governor telemetry
+        if: always()
+        shell: bash
+        run: |
+          rm -f pipeline/.env
+          printf '%s\n' "${{ github.run_id }}" > "build/${{ inputs.slug }}/run-id.txt"
+          git config user.name "render-bot"
+          git config user.email "render@users.noreply.github.com"
+          for f in \
+            pipeline/memory.json \
+            "build/${{ inputs.slug }}/script.json" \
+            "build/${{ inputs.slug }}/run-id.txt" \
+            "build/${{ inputs.slug }}/alts.json" \
+            "build/${{ inputs.slug }}/governor-summary.json" \
+            "build/${{ inputs.slug }}/governor-review.json" \
+            "build/${{ inputs.slug }}/render-status.json" \
+            "build/${{ inputs.slug }}/quality_report.json" \
+            "build/${{ inputs.slug }}/narrative_fidelity_report.json" \
+            "build/${{ inputs.slug }}/scene-review.json" \
+            "build/${{ inputs.slug }}"/emb_*.npy; do
+            git add "$f" 2>/dev/null || true
+          done
+          # capture the pre-render memory as the merge base BEFORE committing
+          MEMBASE=$(mktemp)
+          git show HEAD:pipeline/memory.json > "$MEMBASE" 2>/dev/null || echo '{}' > "$MEMBASE"
+          git commit -m "render ${{ inputs.slug }}: persist outcome and governor telemetry" || echo "nothing to commit"
+          # conflict-proof retry: snapshot our outcome files, replay them on fresh remote tip
+          SNAP=$(mktemp -d)
+          git show --pretty= --name-only HEAD | while read -r f; do
+            [ -f "$f" ] && mkdir -p "$SNAP/$(dirname "$f")" && cp "$f" "$SNAP/$f" || true
+          done
+          for i in 1 2 3 4 5; do
+            git push && exit 0
+            git fetch origin main
+            git reset --hard origin/main
+            (cd "$SNAP" && find . -type f | while read -r f; do
+              mkdir -p "$GITHUB_WORKSPACE/$(dirname "$f")" && cp "$f" "$GITHUB_WORKSPACE/$f"
+            done)
+            # pipeline/memory.json is SHARED across concurrent renders. Replaying our
+            # snapshot wholesale would erase whatever the other render just learned,
+            # so three-way merge it against the tip we just reset onto instead.
+            if [ -f "$SNAP/pipeline/memory.json" ]; then
+              git show origin/main:pipeline/memory.json > /tmp/memory.theirs.json 2>/dev/null || echo '{}' > /tmp/memory.theirs.json
+              python3 pipeline/merge_memory.py \
+                "$MEMBASE" "$SNAP/pipeline/memory.json" /tmp/memory.theirs.json \
+                pipeline/memory.json \
+                || cp "$SNAP/pipeline/memory.json" pipeline/memory.json
+            fi
+            (cd "$SNAP" && find . -type f | sed 's|^\./||') | while read -r f; do
+              git add "$f" || true
+            done
+            git commit -m "render ${{ inputs.slug }}: persist outcome and governor telemetry" || echo "nothing to commit"
+            sleep $((i * 2))
+          done
+          echo "unable to push render outcome after 5 attempts" >&2
+          exit 1

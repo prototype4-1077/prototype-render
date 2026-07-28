@@ -1,0 +1,187 @@
+name: Legacy remake packages integrity
+
+on:
+  pull_request:
+    paths:
+      - "build/the-emotion-scam-tier1/script.json"
+      - "build/june-oxley-folks-aint-roadblocks-tier1/script.json"
+      - "build/june-oxley-left-the-vehicle/script.json"
+      - "concept/characters/june_oxley.json"
+      - "pipeline/animation_profiles.py"
+      - "pipeline/animation_style_profiles.json"
+      - "pipeline/governed_build.py"
+      - "pipeline/profiles.py"
+      - ".github/workflows/legacy-remake-packages-integrity.yml"
+  push:
+    branches: [main]
+    paths:
+      - "build/the-emotion-scam-tier1/script.json"
+      - "build/june-oxley-folks-aint-roadblocks-tier1/script.json"
+      - "build/june-oxley-left-the-vehicle/script.json"
+      - "concept/characters/june_oxley.json"
+      - "pipeline/animation_profiles.py"
+      - "pipeline/animation_style_profiles.json"
+      - "pipeline/governed_build.py"
+      - "pipeline/profiles.py"
+      - ".github/workflows/legacy-remake-packages-integrity.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+      PYTHONPATH: pipeline
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install focused pipeline dependencies
+        run: pip install -q numpy Pillow
+
+      - name: Validate narration, ethos, voice, animation, and motion contracts
+        id: package_tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 - <<'PY' 2>&1 | tee legacy-remake-package-tests.log
+          import copy
+          import json
+          from pathlib import Path
+
+          import animation_profiles
+          import governed_build
+          import profiles
+          import visual_symbols
+
+          SPUDS_ID = 'NOpBlnGInO9m6vDvFkFC'
+          packages = {
+              'build/the-emotion-scam-tier1/script.json': {
+                  'animation': 'animated_tier1',
+                  'profile': None,
+              },
+              'build/june-oxley-folks-aint-roadblocks-tier1/script.json': {
+                  'animation': 'june_oxley_animated_tier1',
+                  'profile': 'june_oxley',
+              },
+              'build/june-oxley-left-the-vehicle/script.json': {
+                  'animation': None,
+                  'profile': 'june_oxley',
+              },
+          }
+
+          errors = []
+          def check(filename, condition, message):
+              if not condition:
+                  errors.append(f'{filename}: {message}')
+
+          for filename, expected in packages.items():
+              script = json.loads(Path(filename).read_text(encoding='utf-8'))
+              scenes = script.get('scenes') or []
+              words = sum(len(str(scene.get('text') or '').split()) for scene in scenes)
+
+              check(filename, len(scenes) == 24, f'scene count {len(scenes)} != 24')
+              check(filename, 320 <= words <= 350, f'word count {words} outside 320-350')
+              check(filename, script.get('science_fidelity') in {'established', 'emerging', 'metaphor'},
+                    f"invalid science_fidelity {script.get('science_fidelity')!r}")
+              check(filename, bool(script.get('evidence_boundary')), 'missing evidence_boundary')
+              check(filename, bool(script.get('grounding')), 'missing grounding')
+              check(filename, str(script.get('invitation') or '').endswith('?'), 'top-level invitation is not a question')
+              check(filename, bool(scenes) and str(scenes[-1].get('text') or '').endswith('?'), 'final narration is not a question')
+              check(filename, bool(scenes) and scenes[-1].get('epistemic_role') == 'invitation', 'final role is not invitation')
+              check(filename, any(scene.get('visual_function') == 'grounding' for scene in scenes[-4:]),
+                    'no grounding beat in final four scenes')
+              check(filename, script.get('hero_art_status') == 'not_required_no_static_hero_scenes',
+                    f"unexpected hero_art_status {script.get('hero_art_status')!r}")
+              check(filename, not any(scene.get('hero') for scene in scenes), 'static hero requested')
+              check(filename, all(scene.get('motion_kind') == 'video' for scene in scenes), 'non-video motion_kind present')
+              check(filename, all(scene.get('motion_mode') in {'stock', 'video', 'i2v', 'image_to_video'} for scene in scenes),
+                    'non-temporal motion_mode present')
+
+              visible = ' '.join(str(scene.get('text') or '') for scene in scenes)
+              check(filename, '[' not in visible and ']' not in visible, 'visible performance tag present')
+
+              initial_character = profiles.resolve(script, strict=True)
+              animation = animation_profiles.resolve(script, strict=True)
+              check(filename, animation == expected['animation'],
+                    f"animation {animation!r} != {expected['animation']!r}")
+
+              prepared = copy.deepcopy(script)
+              animation_changed = animation_profiles.apply_defaults(
+                  prepared, character_profile=initial_character, strict=True
+              )
+              character = profiles.resolve(prepared, strict=True)
+              voice_changed = governed_build._apply_character_voice(prepared, character)
+              check(filename, character == expected['profile'],
+                    f"character {character!r} != {expected['profile']!r}")
+              if animation:
+                  for scene in prepared.get('scenes') or []:
+                      styled = animation_profiles.effective_query(scene, animation)
+                      if styled:
+                          scene['query'] = styled
+              animation_errors = animation_profiles.validate(prepared, character)
+              check(filename, not animation_errors, f'animation preflight errors {animation_errors}')
+
+              if character == profiles.JUNE_OXLEY:
+                  check(filename, prepared.get('elevenlabs_voice_name') == 'Granpa Spuds Oxley',
+                        f"wrong June voice {prepared.get('elevenlabs_voice_name')!r}")
+                  check(filename, prepared.get('elevenlabs_voice_id') == SPUDS_ID,
+                        f"June voice ID {prepared.get('elevenlabs_voice_id')!r} != {SPUDS_ID}")
+                  check(filename, voice_changed or script.get('elevenlabs_voice_id') == SPUDS_ID,
+                        'canonical June voice was not confirmed by preflight')
+              else:
+                  check(filename, prepared.get('elevenlabs_voice_id') == 'TX3LPaxmHKxFdv7VOQHJ',
+                        'regular video does not explicitly use Liam')
+
+              if animation:
+                  check(filename, animation_changed is True or script.get('animation_contract_version') == 1,
+                        f'animation preflight did not establish its contract: {animation_changed!r}')
+              else:
+                  check(filename, animation_changed is False,
+                        f'ordinary June unexpectedly changed by animation preflight: {animation_changed!r}')
+
+              report = visual_symbols.analyze(copy.deepcopy(prepared), character)
+              check(filename, not report['violations'], f"visual violations {report['violations']}")
+              check(filename, report['symbol_family_count'] >= 6,
+                    f"only {report['symbol_family_count']} visual families")
+              print(
+                  f"PASS-MEASURE {filename} scenes={len(scenes)} words={words} "
+                  f"human={report['human_presence_ratio']:.1%} "
+                  f"families={report['symbol_family_count']} "
+                  f"run={report['longest_family_run']['value']}:"
+                  f"{report['longest_family_run']['length']} "
+                  f"voice={prepared.get('elevenlabs_voice_id')}"
+              )
+
+          if errors:
+              print('PACKAGE VALIDATION ERRORS:')
+              for error in errors:
+                  print(' -', error)
+              raise SystemExit(1)
+          print('ALL THREE REMAKE PACKAGES PASSED PRODUCTION PREFLIGHT')
+          PY
+
+      - name: Upload package test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: legacy-remake-package-tests-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: legacy-remake-package-tests.log
+
+      - name: Enforce package test result
+        if: steps.package_tests.outcome != 'success'
+        run: |
+          tail -120 legacy-remake-package-tests.log
+          exit 1

@@ -1,0 +1,110 @@
+name: Animation profiles integrity
+
+on:
+  pull_request:
+    paths:
+      - "pipeline/animation_profiles.py"
+      - "pipeline/animation_style_profiles.json"
+      - "pipeline/profiles.py"
+      - "pipeline/governed_build.py"
+      - "pipeline/ANIMATION_PROFILES.md"
+      - "pipeline/tests/test_animation_profiles.py"
+      - "pipeline/tests/test_profiles.py"
+      - ".github/workflows/animation-profiles-integrity.yml"
+  push:
+    branches: [main]
+    paths:
+      - "pipeline/animation_profiles.py"
+      - "pipeline/animation_style_profiles.json"
+      - "pipeline/profiles.py"
+      - "pipeline/governed_build.py"
+      - "pipeline/tests/test_animation_profiles.py"
+      - "pipeline/tests/test_profiles.py"
+      - ".github/workflows/animation-profiles-integrity.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          show-progress: false
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install focused pipeline dependencies
+        run: pip install -q numpy Pillow
+
+      - name: Compile and validate profile data
+        run: |
+          python3 -m py_compile \
+            pipeline/animation_profiles.py \
+            pipeline/profiles.py \
+            pipeline/governed_build.py
+          python3 - <<'PY'
+          import json
+          data = json.load(open('pipeline/animation_style_profiles.json', encoding='utf-8'))
+          assert set(data['profiles']) == {
+              'animated_tier1',
+              'june_oxley_animated_tier1',
+              'june_oxley_animated_standard',
+          }
+          PY
+
+      - name: Run animation and character profile tests
+        id: focused_tests
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          python3 -m unittest \
+            pipeline.tests.test_animation_profiles \
+            pipeline.tests.test_profiles -v \
+            2>&1 | tee animation-profile-tests.log
+
+      - name: Upload focused test evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: animation-profile-tests-${{ github.run_id }}
+          retention-days: 30
+          if-no-files-found: error
+          path: animation-profile-tests.log
+
+      - name: Enforce focused test result
+        if: steps.focused_tests.outcome != 'success'
+        run: |
+          tail -120 animation-profile-tests.log
+          exit 1
+
+      - name: Verify standing quality boundaries
+        run: |
+          python3 - <<'PY'
+          import json
+          data = json.load(open('pipeline/animation_style_profiles.json', encoding='utf-8'))['profiles']
+          assert data['animated_tier1']['minimum_true_motion_ratio'] >= 0.80
+          assert data['june_oxley_animated_tier1']['minimum_true_motion_ratio'] >= 0.80
+          assert data['june_oxley_animated_standard']['minimum_true_motion_ratio'] >= 0.70
+          assert data['animated_tier1']['max_still_source_ratio'] <= 0.20
+          assert data['june_oxley_animated_tier1']['max_still_source_ratio'] <= 0.20
+          assert data['june_oxley_animated_standard']['max_still_source_ratio'] <= 0.30
+          assert data['june_oxley_animated_tier1']['character_reference_id'] == 'june_oxley_v1'
+          assert data['june_oxley_animated_standard']['character_reference_id'] == 'june_oxley_v1'
+          assert data['june_oxley_animated_tier1']['character_prompt_suffix']
+          assert data['june_oxley_animated_standard']['character_prompt_suffix']
+          assert 'elderly white rural man' not in data['june_oxley_animated_tier1']['prompt_suffix']
+          assert 'elderly white rural man' not in data['june_oxley_animated_standard']['prompt_suffix']
+          text = open('pipeline/profiles.py', encoding='utf-8').read()
+          assert 'Granpa Spuds Oxley' in text
+          assert 'never silently substitute Liam' in text
+          assert 'no political identity' in text
+          PY

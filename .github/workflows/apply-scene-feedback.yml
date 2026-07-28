@@ -1,0 +1,228 @@
+name: Apply scene feedback
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: Build slug with an exported scene-feedback request
+        required: true
+        type: string
+  push:
+    paths:
+      - "build/*/scene-feedback.request.json"
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: scene-feedback-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  apply:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - name: Resolve and validate feedback
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          slug="${{ inputs.slug }}"
+          if [ -n "$slug" ]; then
+            feedback="build/$slug/scene-feedback.request.json"
+          else
+            feedback="$(git diff-tree --no-commit-id --name-only -r "$GITHUB_SHA" \
+              | grep -E '^build/[^/]+/scene-feedback\.request\.json$' | head -n 1)"
+            test -n "$feedback"
+            slug="${feedback#build/}"
+            slug="${slug%%/*}"
+          fi
+          script="build/$slug/script.json"
+          overrides="build/$slug/scene-revision-overrides.json"
+          test -f "$feedback"
+          test -f "$script"
+          test -f "$overrides"
+          cp "$script" /tmp/original-script.json
+          review_id="$(python3 - "$script" "$feedback" "$overrides" <<'PY'
+          import hashlib
+          import json
+          import sys
+
+          script = json.load(open(sys.argv[1], encoding="utf-8"))
+          feedback = json.load(open(sys.argv[2], encoding="utf-8"))
+          overrides = json.load(open(sys.argv[3], encoding="utf-8"))
+          if feedback.get("slug") != script.get("slug"):
+              raise SystemExit("feedback slug does not match script")
+          if overrides.get("slug") != script.get("slug"):
+              raise SystemExit("override slug does not match script")
+          scenes = feedback.get("scenes") or []
+          if len(scenes) != len(script.get("scenes") or []):
+              raise SystemExit("feedback must include every scene")
+          seen = set()
+          revised = set()
+          for item in scenes:
+              index = int(item.get("scene_index"))
+              if index in seen or index < 0 or index >= len(scenes):
+                  raise SystemExit(f"invalid or duplicate scene index: {index}")
+              seen.add(index)
+              decision = str(item.get("decision") or "").lower()
+              if decision not in {"approved", "approve", "revise", "revision", "needs_revision"}:
+                  raise SystemExit(f"scene {index + 1} is not reviewed")
+              if decision in {"revise", "revision", "needs_revision"}:
+                  if not str(item.get("comments") or "").strip():
+                      raise SystemExit(f"scene {index + 1} needs a revision comment")
+                  revised.add(index)
+          override_indices = {int(item["scene_index"]) for item in overrides.get("revisions") or []}
+          if override_indices != revised:
+              raise SystemExit(
+                  f"revision overrides {sorted(override_indices)} do not match feedback revisions {sorted(revised)}"
+              )
+          overall = feedback.get("overall") or {}
+          if str(overall.get("decision") or "").lower() not in {"revise", "revision", "needs_revision"}:
+              raise SystemExit("overall decision must request revision")
+          print(hashlib.sha256(json.dumps(feedback, sort_keys=True, ensure_ascii=True).encode()).hexdigest())
+          PY
+          )"
+          fresh="$(python3 - "$review_id" <<'PY'
+          import json
+          import sys
+          memory = json.load(open("pipeline/memory.json", encoding="utf-8"))
+          print("false" if sys.argv[1] in memory.get("scene_review_ids", []) else "true")
+          PY
+          )"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+          echo "feedback=$feedback" >> "$GITHUB_OUTPUT"
+          echo "overrides=$overrides" >> "$GITHUB_OUTPUT"
+          echo "review_id=$review_id" >> "$GITHUB_OUTPUT"
+          echo "fresh=$fresh" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        if: steps.target.outputs.fresh == 'true'
+        with:
+          python-version: "3.11"
+
+      - name: Install learning dependency and run regressions
+        if: steps.target.outputs.fresh == 'true'
+        run: |
+          python -m pip install --quiet numpy
+          python -m py_compile pipeline/learn.py pipeline/review.py pipeline/selective_revision.py
+          python -m unittest pipeline.tests.test_review pipeline.tests.test_editorial_revision
+
+      - name: Apply survey learning
+        if: steps.target.outputs.fresh == 'true'
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+          FEEDBACK: ${{ steps.target.outputs.feedback }}
+        run: python3 pipeline/learn.py survey "build/$SLUG" "$FEEDBACK"
+
+      - name: Apply visual-only revision directions
+        if: steps.target.outputs.fresh == 'true'
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+          FEEDBACK: ${{ steps.target.outputs.feedback }}
+          OVERRIDES: ${{ steps.target.outputs.overrides }}
+        shell: bash
+        run: |
+          python3 - "build/$SLUG/script.json" "$FEEDBACK" "$OVERRIDES" /tmp/original-script.json <<'PY'
+          import copy
+          import hashlib
+          import json
+          import os
+          import sys
+
+          script_path, feedback_path, overrides_path, original_path = sys.argv[1:]
+          script = json.load(open(script_path, encoding="utf-8"))
+          feedback = json.load(open(feedback_path, encoding="utf-8"))
+          overrides = json.load(open(overrides_path, encoding="utf-8"))
+          original = json.load(open(original_path, encoding="utf-8"))
+          decisions = {
+              int(item["scene_index"]): str(item.get("decision") or "").lower()
+              for item in feedback["scenes"]
+          }
+          before_text = [scene["text"] for scene in original["scenes"]]
+          approved_before = {
+              index: copy.deepcopy(scene)
+              for index, scene in enumerate(original["scenes"])
+              if decisions[index] in {"approved", "approve"}
+          }
+          for revision in overrides["revisions"]:
+              index = int(revision["scene_index"])
+              scene = script["scenes"][index]
+              for key in (overrides.get("common_remove") or []) + (revision.get("remove") or []):
+                  scene.pop(key, None)
+              scene.update(revision.get("set") or {})
+              scene["revision_note"] = next(
+                  item.get("comments", "") for item in feedback["scenes"]
+                  if int(item["scene_index"]) == index
+              )
+          if [scene["text"] for scene in script["scenes"]] != before_text:
+              raise SystemExit("revision directions changed narration text")
+          for index, scene in approved_before.items():
+              if script["scenes"][index] != scene:
+                  raise SystemExit(f"approved scene {index + 1} was modified")
+          script["scene_feedback_reviewed_at"] = feedback.get("reviewed_at")
+          script["scene_feedback_revision_count"] = len(overrides["revisions"])
+          with open(script_path, "w", encoding="utf-8") as handle:
+              json.dump(script, handle, indent=1, ensure_ascii=False)
+              handle.write("\n")
+
+          decisions_list = [str(item.get("decision") or "").lower() for item in feedback["scenes"]]
+          application = {
+              "schema_version": 2,
+              "slug": feedback["slug"],
+              "reviewed_at": feedback.get("reviewed_at"),
+              "applied_by_workflow_run": os.environ.get("GITHUB_RUN_ID"),
+              "review_id": hashlib.sha256(
+                  json.dumps(feedback, sort_keys=True, ensure_ascii=True).encode()
+              ).hexdigest(),
+              "approved_scenes": sum(value in {"approved", "approve"} for value in decisions_list),
+              "revision_scenes": sum(value in {"revise", "revision", "needs_revision"} for value in decisions_list),
+              "overall": feedback.get("overall") or {},
+              "render_dispatched": True,
+              "render_mode": "selective_with_full_fallback",
+          }
+          with open(f"build/{feedback['slug']}/feedback-application.json", "w", encoding="utf-8") as handle:
+              json.dump(application, handle, indent=2)
+              handle.write("\n")
+          PY
+
+      - name: Commit learned state
+        if: steps.target.outputs.fresh == 'true'
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "feedback-bot"
+          git config user.email "feedback@users.noreply.github.com"
+          git add \
+            pipeline/memory.json \
+            pipeline/taste.npz \
+            "build/$SLUG/script.json" \
+            "build/$SLUG/scene-review-feedback.json" \
+            "build/$SLUG/scene-feedback.request.json" \
+            "build/$SLUG/scene-revision-overrides.json" \
+            "build/$SLUG/feedback-application.json"
+          git commit -m "feedback $SLUG: learn survey and queue selective revision"
+          for attempt in 1 2 3 4 5; do
+            git push && exit 0
+            git add -A; git pull --rebase --autostash origin main || git rebase --abort || true
+            sleep $((attempt * 2))
+          done
+          exit 1
+
+      - name: Dispatch selective revision
+        if: steps.target.outputs.fresh == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ steps.target.outputs.slug }}
+        run: gh workflow run selective-revision.yml --ref main -f slug="$SLUG" -f long_render=true
+
+      - name: Report duplicate feedback
+        if: steps.target.outputs.fresh != 'true'
+        run: echo "This exact scene survey was already applied; no duplicate training or render was created."

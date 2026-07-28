@@ -1,0 +1,82 @@
+name: Perpetual Frontier integrity
+
+on:
+  pull_request:
+    paths:
+      - "concept/perpetual_frontier.py"
+      - "concept/evolution_constitution.json"
+      - "concept/provisional_rules.json"
+      - "concept/capability_constitution.json"
+      - "concept/expedition_library.json"
+      - "concept/PERPETUAL_FRONTIER.md"
+      - "concept/tests/test_perpetual_frontier.py"
+      - ".github/workflows/perpetual-frontier-*.yml"
+  push:
+    branches: [main]
+    paths:
+      - "concept/perpetual_frontier.py"
+      - "concept/evolution_constitution.json"
+      - "concept/provisional_rules.json"
+      - "concept/capability_constitution.json"
+      - "concept/expedition_library.json"
+      - "concept/tests/test_perpetual_frontier.py"
+      - ".github/workflows/perpetual-frontier-*.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHONDONTWRITEBYTECODE: "1"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile and validate constitutions
+        run: |
+          python3 -m py_compile concept/perpetual_frontier.py
+          python3 - <<'PY'
+          import json
+          paths = [
+              'concept/evolution_constitution.json',
+              'concept/provisional_rules.json',
+              'concept/capability_constitution.json',
+              'concept/expedition_library.json',
+          ]
+          for path in paths:
+              json.load(open(path, encoding='utf-8'))
+              print('valid', path)
+          PY
+
+      - name: Run evolution-loop tests
+        run: python3 -m unittest concept.tests.test_perpetual_frontier -v
+
+      - name: Exercise real repository evidence in observation-only mode
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 concept/perpetual_frontier.py --root . --date 2026-07-23 > /tmp/frontier-brief.txt
+          test -s concept/evolution_state/LATEST.json
+          test -s concept/evolution_state/BRIEF.md
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          state = json.load(open('concept/evolution_state/LATEST.json', encoding='utf-8'))
+          assert state['production_files_modified'] is False
+          assert state['requires_human_selection'] is True
+          assert state['surprise_portfolio']['allocation']['wild'] > 0
+          assert all(dream['fidelity'] == 'metaphor' for dream in state['dreams'])
+          assert all(dream['invitation'].endswith('?') for dream in state['dreams'])
+          forbidden = list(Path('build').glob('*/render.request')) if Path('build').exists() else []
+          assert not forbidden, forbidden
+          PY
+          find concept -type d -name __pycache__ -prune -exec rm -rf {} +
+          changed="$(git status --porcelain | awk '{print $2}' | grep -v '^concept/evolution_state/' || true)"
+          test -z "$changed" || { echo "unexpected changed paths:"; echo "$changed"; exit 1; }

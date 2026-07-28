@@ -1,0 +1,260 @@
+name: Selective scene revision
+
+on:
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: Build slug with applied scene feedback
+        required: true
+        type: string
+      long_render:
+        description: Allow the full render budget for revised scenes
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: render-${{ inputs.slug }}
+  cancel-in-progress: false
+
+jobs:
+  revise:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Restore revision cache or fall back safely
+        id: mode
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ inputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          pointer="build/$SLUG/revision-cache-run-id.txt"
+          if [ ! -s "$pointer" ]; then
+            echo "No selective cache pointer; dispatching the proven full render."
+            gh workflow run render.yml --ref main -f slug="$SLUG" -f long_render=true
+            echo "selective=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cache_run="$(tr -d '[:space:]' < "$pointer")"
+          mkdir -p "build/$SLUG"
+          if ! gh run download "$cache_run" -n "$SLUG-revision-cache" -D "build/$SLUG"; then
+            echo "Revision cache unavailable; dispatching the proven full render."
+            gh workflow run render.yml --ref main -f slug="$SLUG" -f long_render=true
+            echo "selective=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          test -s "build/$SLUG/revision-cache-manifest.json"
+          echo "selective=true" >> "$GITHUB_OUTPUT"
+          echo "cache_run=$cache_run" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-python@v5
+        if: steps.mode.outputs.selective == 'true'
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: System and Python dependencies
+        if: steps.mode.outputs.selective == 'true'
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ffmpeg
+          pip install -q -r pipeline/requirements.txt
+
+      - name: Validate cache and lock approved scene masters
+        if: steps.mode.outputs.selective == 'true'
+        env:
+          SLUG: ${{ inputs.slug }}
+        run: |
+          python3 pipeline/revision_cache.py validate "build/$SLUG"
+          python3 pipeline/selective_revision.py prepare "build/$SLUG"
+
+      - name: API keys for revised visual acquisition
+        if: steps.mode.outputs.selective == 'true'
+        run: |
+          printf 'ELEVENLABS_API_KEY=%s\nPEXELS_API_KEY=%s\nELEVENLABS_VOICE_ID=%s\n' \
+            "${{ secrets.ELEVENLABS_API_KEY }}" "${{ secrets.PEXELS_API_KEY }}" \
+            "${{ secrets.ELEVENLABS_VOICE_ID || 'TX3LPaxmHKxFdv7VOQHJ' }}" > pipeline/.env
+
+      - name: Regenerate rejected scenes and reassemble
+        if: steps.mode.outputs.selective == 'true'
+        env:
+          SLUG: ${{ inputs.slug }}
+          SEMANTIC_CLIP: "1"
+          GOVERNOR_MODE: "recover"
+          BUILD_PASS_BUDGET: "3600"
+          TRANSCRIBE_CHUNK_SECONDS: "100000"
+          GOVERNOR_CONSOLE_HEARTBEATS: "1"
+          GOVERNOR_HEARTBEAT_SECONDS: "15"
+          PYTHONUNBUFFERED: "1"
+        run: |
+          python3 pipeline/run_governed.py "build/$SLUG" \
+            --max-passes 200 --overall-timeout ${{ inputs.long_render && '4680' || '2700' }}
+
+      - name: Restore exact approved delivery audio
+        if: steps.mode.outputs.selective == 'true'
+        env:
+          SLUG: ${{ inputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          finals=(build/$SLUG/final*.mp4)
+          test "${#finals[@]}" -ge 1
+          for video in "${finals[@]}"; do
+            [[ "$(basename "$video")" == *short* ]] && continue
+            python3 pipeline/locked_audio.py apply "$video" "build/$SLUG"
+          done
+          python3 pipeline/locked_audio.py verify "build/$SLUG"
+          python3 pipeline/quality_gate.py "build/$SLUG"
+
+      - name: Prove approved scenes, narration, and audio were preserved
+        if: steps.mode.outputs.selective == 'true'
+        env:
+          SLUG: ${{ inputs.slug }}
+        run: python3 pipeline/selective_revision.py finalize "build/$SLUG"
+
+      - name: Rebuild canonical timeline and inspect export
+        if: steps.mode.outputs.selective == 'true'
+        env:
+          SLUG: ${{ inputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 pipeline/editorial_timeline.py build "build/$SLUG"
+          python3 pipeline/editorial_timeline.py verify "build/$SLUG"
+          shopt -s nullglob
+          finals=(build/$SLUG/final*.mp4)
+          test "${#finals[@]}" -ge 1
+          for video in "${finals[@]}"; do
+            python3 pipeline/export_verify.py "build/$SLUG" "$(basename "$video")" --frames
+          done
+          python3 pipeline/revision_cache.py build "build/$SLUG" --run-id "$GITHUB_RUN_ID"
+
+      - name: Upload revised final and review package
+        if: steps.mode.outputs.selective == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.slug }}
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            build/${{ inputs.slug }}/final*.mp4
+            build/${{ inputs.slug }}/alts_sheet.jpg
+            build/${{ inputs.slug }}/motion_report.json
+            build/${{ inputs.slug }}/visual_symbol_report.json
+            build/${{ inputs.slug }}/still_reference_report.json
+            build/${{ inputs.slug }}/music_variants.json
+            build/${{ inputs.slug }}/scene-review.html
+            build/${{ inputs.slug }}/scene-review.json
+            build/${{ inputs.slug }}/CREDITS.txt
+            build/${{ inputs.slug }}/editorial.otio
+            build/${{ inputs.slug }}/editorial_manifest.json
+            build/${{ inputs.slug }}/editorial-verification.json
+            build/${{ inputs.slug }}/locked-audio-manifest.json
+            build/${{ inputs.slug }}/selective-revision-result.json
+            build/${{ inputs.slug }}/export-verification*.json
+            build/${{ inputs.slug }}/detected-scenes*.csv
+            build/${{ inputs.slug }}/verification_frames/**
+
+      - name: Upload refreshed selective-revision cache
+        if: steps.mode.outputs.selective == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.slug }}-revision-cache
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            build/${{ inputs.slug }}/clip_*.mp4
+            build/${{ inputs.slug }}/seg_*.mp4
+            build/${{ inputs.slug }}/youtube_seg_*.mp4
+            build/${{ inputs.slug }}/*.mp3
+            build/${{ inputs.slug }}/*.wav
+            build/${{ inputs.slug }}/*.m4a
+            build/${{ inputs.slug }}/*.png
+            build/${{ inputs.slug }}/*.jpg
+            build/${{ inputs.slug }}/*.jpeg
+            build/${{ inputs.slug }}/*.webp
+            build/${{ inputs.slug }}/*.npy
+            build/${{ inputs.slug }}/words.json
+            build/${{ inputs.slug }}/voiceover-manifest.json
+            build/${{ inputs.slug }}/music_variants.json
+            build/${{ inputs.slug }}/alts.json
+            build/${{ inputs.slug }}/motion_report.json
+            build/${{ inputs.slug }}/still_reference_report.json
+            build/${{ inputs.slug }}/visual_symbol_report.json
+            build/${{ inputs.slug }}/editorial.otio
+            build/${{ inputs.slug }}/editorial_manifest.json
+            build/${{ inputs.slug }}/editorial-verification.json
+            build/${{ inputs.slug }}/locked-audio-manifest.json
+            build/${{ inputs.slug }}/revision-cache-manifest.json
+
+      - name: Publish revised final and editorial records
+        if: steps.mode.outputs.selective == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ inputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="video-$SLUG"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "$SLUG" --notes "Selective revision $GITHUB_RUN_ID"
+          shopt -s nullglob
+          for file in \
+            build/$SLUG/final*.mp4 \
+            "build/$SLUG/editorial.otio" \
+            "build/$SLUG/editorial_manifest.json" \
+            "build/$SLUG/editorial-verification.json" \
+            "build/$SLUG/locked-audio-manifest.json" \
+            "build/$SLUG/selective-revision-result.json" \
+            "build/$SLUG/revision-cache-manifest.json" \
+            build/$SLUG/export-verification*.json \
+            build/$SLUG/detected-scenes*.csv; do
+            test -f "$file" && gh release upload "$tag" "$file" --clobber
+          done
+
+      - name: Commit selective revision outcome
+        if: steps.mode.outputs.selective == 'true'
+        env:
+          SLUG: ${{ inputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -f pipeline/.env
+          printf '%s\n' "$GITHUB_RUN_ID" > "build/$SLUG/run-id.txt"
+          printf '%s\n' "$GITHUB_RUN_ID" > "build/$SLUG/revision-cache-run-id.txt"
+          git config user.name "revision-bot"
+          git config user.email "revision@users.noreply.github.com"
+          git add \
+            "build/$SLUG/script.json" \
+            "build/$SLUG/run-id.txt" \
+            "build/$SLUG/revision-cache-run-id.txt" \
+            "build/$SLUG/selective-revision.json" \
+            "build/$SLUG/selective-revision-result.json" \
+            "build/$SLUG/editorial.otio" \
+            "build/$SLUG/editorial_manifest.json" \
+            "build/$SLUG/editorial-verification.json" \
+            "build/$SLUG/locked-audio-manifest.json" \
+            "build/$SLUG/revision-cache-manifest.json" \
+            "build/$SLUG/quality_report.json" \
+            "build/$SLUG/render-status.json" \
+            "build/$SLUG/scene-review.json" \
+            "build/$SLUG"/export-verification*.json \
+            "build/$SLUG"/detected-scenes*.csv
+          git commit -m "revision $SLUG: replace rejected scenes only" || exit 0
+          for attempt in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || git rebase --abort || true
+            sleep $((attempt * 2))
+          done
+          exit 1

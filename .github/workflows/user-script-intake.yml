@@ -1,0 +1,200 @@
+name: Package user-supplied script
+
+# Submit three files under one isolated build slug:
+#   build/<slug>/source-script.txt   authoritative raw script
+#   build/<slug>/submission.json     optional title/voice/profile/output choices
+#   build/<slug>/intake.request      the word go
+# This workflow packages and validates the script but never starts a render.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "build/**/intake.request"
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: "Build slug containing source-script.txt"
+        required: true
+        type: string
+      overwrite:
+        description: "Replace a prior user-intake script.json for this slug"
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: user-script-intake-${{ github.ref }}-${{ inputs.slug || github.sha }}
+  cancel-in-progress: false
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Identify requested slug(s)
+        id: slugs
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+            echo "slugs=${{ inputs.slug }}" >> "$GITHUB_OUTPUT"
+            echo "overwrite=${{ inputs.overwrite }}" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          mapfile -t files < <(git diff-tree --no-commit-id --name-only --diff-filter=AM -r "$GITHUB_SHA" \
+            | grep -E '^build/[^/]+/intake\.request$' || true)
+          slugs=""
+          for file in "${files[@]}"; do
+            slug="${file#build/}"; slug="${slug%/intake.request}"
+            slugs="$slugs $slug"
+          done
+          echo "slugs=$(echo "$slugs" | xargs)" >> "$GITHUB_OUTPUT"
+          echo "overwrite=true" >> "$GITHUB_OUTPUT"
+
+      - name: Package exact user narration and run zero-cost gates
+        if: steps.slugs.outputs.slugs != ''
+        id: intake
+        shell: bash
+        run: |
+          set -euo pipefail
+          ready=""
+          blocked=""
+          for slug in ${{ steps.slugs.outputs.slugs }}; do
+            build="build/$slug"
+            rm -f "$build/intake-ready.txt" "$build/intake-blocked.txt"
+
+            # An overwrite request may refresh only a package created by this intake
+            # system. It may never replace a hand-built, approved, or legacy package.
+            if [[ -f "$build/script.json" && "${{ steps.slugs.outputs.overwrite }}" == "true" ]]; then
+              if ! python3 - "$build/script.json" <<'PY'
+          import json, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          script = json.loads(path.read_text(encoding="utf-8"))
+          if script.get("script_origin") != "user_supplied_plain_text":
+              raise SystemExit("refusing to overwrite a non-intake script.json")
+          PY
+              then
+                python3 - "$build" <<'PY'
+          import json, pathlib, sys
+          build = pathlib.Path(sys.argv[1])
+          report = {
+              "schema_version": 1,
+              "status": "blocked",
+              "passed": False,
+              "error": "Refusing to overwrite a non-intake script.json. Use a new isolated slug.",
+          }
+          (build / "intake-report.json").write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8")
+          (build / "intake-blocked.txt").write_text(
+              "USER SCRIPT INTAKE BLOCKED\nRefusing to overwrite a non-intake script.json. Use a new isolated slug.\n",
+              encoding="utf-8",
+          )
+          PY
+                blocked="$blocked $slug"
+                continue
+              fi
+            fi
+
+            # The channel's normal package remains 24 scenes. A user can explicitly
+            # override this in submission.json, but an omitted value never triggers
+            # late long-script policy mutation inside the render job.
+            python3 - "$build/submission.json" <<'PY'
+          import json, pathlib, sys
+          path = pathlib.Path(sys.argv[1])
+          payload = {}
+          if path.exists():
+              payload = json.loads(path.read_text(encoding="utf-8"))
+              if not isinstance(payload, dict):
+                  raise SystemExit("submission.json must contain one JSON object")
+          payload.setdefault("target_scenes", 24)
+          path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+          PY
+
+            args=("$build")
+            [[ "${{ steps.slugs.outputs.overwrite }}" == "true" ]] && args+=(--overwrite)
+            if python3 pipeline/user_script_intake.py "${args[@]}" \
+              && python3 pipeline/user_script_intake.py "$build" --verify-only \
+              && python3 pipeline/preflight.py "$build" --fix-safe --record; then
+              python3 pipeline/package_integrity.py snapshot "$build" \
+                --output "$build/package-fingerprint.json"
+              printf 'USER SCRIPT READY\nslug: %s\npackaged: %s\nrender started: no\n' \
+                "$slug" "$(date -u +%FT%TZ)" > "$build/intake-ready.txt"
+              ready="$ready $slug"
+            else
+              python3 - "$build" <<'PY'
+          import json, pathlib, sys
+          build = pathlib.Path(sys.argv[1])
+          intake = {}
+          preflight = {}
+          for name, target in (("intake-report.json", intake), ("preflight-report.json", preflight)):
+              path = build / name
+              if path.exists():
+                  try:
+                      target.update(json.loads(path.read_text(encoding="utf-8")))
+                  except Exception:
+                      pass
+          lines = ["USER SCRIPT INTAKE BLOCKED", f"slug: {build.name}"]
+          if intake.get("error"):
+              lines.append(f"intake: {intake['error']}")
+          for item in preflight.get("blockers") or []:
+              lines.append(f"{item.get('code')}: {item.get('message')}")
+          if len(lines) == 2:
+              lines.append("See intake-report.json and preflight-report.json for details.")
+          (build / "intake-blocked.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+          PY
+              blocked="$blocked $slug"
+            fi
+          done
+          echo "ready=$(echo "$ready" | xargs)" >> "$GITHUB_OUTPUT"
+          echo "blocked=$(echo "$blocked" | xargs)" >> "$GITHUB_OUTPUT"
+
+      - name: Commit package, reports, and request acknowledgement
+        if: steps.slugs.outputs.slugs != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "user-script-intake-bot"
+          git config user.email "user-script-intake@users.noreply.github.com"
+          for slug in ${{ steps.slugs.outputs.slugs }}; do
+            git rm -q "build/$slug/intake.request" 2>/dev/null || true
+            git add \
+              "build/$slug/source-script.txt" \
+              "build/$slug/source-spoken.txt" \
+              "build/$slug/submission.json" \
+              "build/$slug/script.json" \
+              "build/$slug/intake-report.json" \
+              "build/$slug/preflight-report.json" \
+              "build/$slug/package-fingerprint.json" \
+              "build/$slug/intake-ready.txt" \
+              "build/$slug/intake-blocked.txt" 2>/dev/null || true
+          done
+          git add pipeline/operational_memory/occurrences 2>/dev/null || true
+          git commit -m "user-script: package ${{ steps.slugs.outputs.slugs }}" || exit 0
+          for attempt in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || { git rebase --abort || true; }
+            sleep $((attempt * 2))
+          done
+          echo "unable to persist user-script intake package" >&2
+          exit 1
+
+      - name: Enforce non-rendering authority boundary
+        if: steps.slugs.outputs.slugs != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          for slug in ${{ steps.slugs.outputs.slugs }}; do
+            test ! -f "build/$slug/render.request"
+            test ! -f "build/$slug/render-started.txt"
+          done

@@ -1,0 +1,278 @@
+name: Render supplied short media
+
+on:
+  workflow_call:
+    inputs:
+      slug:
+        type: string
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: render-short-${{ inputs.slug }}
+  cancel-in-progress: false
+
+jobs:
+  render:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Restore connector-uploaded voiceover
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - "${{ inputs.slug }}" <<'PY'
+          import base64
+          import hashlib
+          from pathlib import Path
+          import sys
+
+          build = Path('build') / sys.argv[1]
+          parts = sorted(build.glob('vo.mp3.b64.part*'))
+          if not parts:
+              raise SystemExit('no connector-uploaded voiceover parts were found')
+          encoded = ''.join(
+              ''.join(part.read_text(encoding='ascii').split())
+              for part in parts
+          )
+          try:
+              raw = base64.b64decode(encoded, validate=True)
+          except Exception as exc:
+              raise SystemExit(f'voiceover Base64 transport is invalid: {exc}') from exc
+          if not raw:
+              raise SystemExit('voiceover transport decoded to zero bytes')
+          output = build / 'vo.mp3'
+          output.write_bytes(raw)
+          print(
+              f'restored {output} from {len(parts)} ordered parts: '
+              f'{len(raw)} bytes, sha256={hashlib.sha256(raw).hexdigest()}'
+          )
+          PY
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Cache models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            /tmp/clipcache
+            /tmp/models
+          key: models-v1
+
+      - name: System dependencies
+        run: sudo apt-get update -q && sudo apt-get install -y -q ffmpeg
+
+      - name: Validate short supplied narration
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import subprocess
+
+          build = Path("build/${{ inputs.slug }}")
+          script_path = build / "script.json"
+          voice_path = build / "vo.mp3"
+          script = json.loads(script_path.read_text(encoding="utf-8"))
+          expected = script.get("source_audio") or {}
+
+          size_bytes = voice_path.stat().st_size
+          probe = subprocess.run(
+              [
+                  "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                  "-of", "default=noprint_wrappers=1:nokey=1", str(voice_path),
+              ],
+              check=True,
+              capture_output=True,
+              text=True,
+          )
+          duration = float(probe.stdout.strip() or 0)
+          if duration < 0.5 or size_bytes < 1_024:
+              raise SystemExit(
+                  f"supplied narration is unusable: {duration:.3f}s, {size_bytes} bytes"
+              )
+
+          actual_sha = hashlib.sha256(voice_path.read_bytes()).hexdigest()
+          expected_sha = expected.get("sha256")
+          expected_size = int(expected.get("size_bytes") or 0)
+          exact = actual_sha == expected_sha and size_bytes == expected_size
+          report = {
+              "duration_seconds": duration,
+              "size_bytes": size_bytes,
+              "sha256": actual_sha,
+              "expected_sha256": expected_sha,
+              "expected_size_bytes": expected_size,
+              "exact_transport_match": exact,
+              "minimum_duration_seconds": 0.5,
+              "minimum_size_bytes": 1024,
+              "accepted": True,
+          }
+          (build / "audio-transport-diagnostic.json").write_text(
+              json.dumps(report, indent=2) + "\n", encoding="utf-8"
+          )
+          script["user_vo"] = True
+          script_path.write_text(
+              json.dumps(script, ensure_ascii=False, separators=(",", ":")),
+              encoding="utf-8",
+          )
+          print(
+              f"Accepted supplied narration at {duration:.3f}s and {size_bytes} bytes; "
+              f"exact transport match={exact}."
+          )
+          PY
+
+      - name: Python dependencies
+        run: pip install -q -r pipeline/requirements.txt
+
+      - name: Pipeline regression tests
+        run: python3 -m unittest discover -s pipeline/tests -v
+
+      - name: API keys
+        shell: bash
+        run: |
+          printf 'ELEVENLABS_API_KEY=%s\nPEXELS_API_KEY=%s\nELEVENLABS_VOICE_ID=%s\n' \
+            "${{ secrets.ELEVENLABS_API_KEY }}" "${{ secrets.PEXELS_API_KEY }}" \
+            "${{ secrets.ELEVENLABS_VOICE_ID || 'TX3LPaxmHKxFdv7VOQHJ' }}" > pipeline/.env
+
+      - name: Build under adaptive Governor
+        env:
+          SEMANTIC_CLIP: "1"
+          GOVERNOR_MODE: "recover"
+          GOVERNOR_CONSOLE_HEARTBEATS: "1"
+          GOVERNOR_HEARTBEAT_SECONDS: "15"
+          PYTHONUNBUFFERED: "1"
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 pipeline/run_governed.py "build/${{ inputs.slug }}" \
+            --max-passes 200 --overall-timeout 4680
+          python3 - "build/${{ inputs.slug }}/script.json" <<'PY'
+          import json
+          import os
+          import sys
+
+          sys.path.insert(0, "pipeline")
+          import render_policy
+
+          script = json.load(open(sys.argv[1], encoding="utf-8"))
+          build_dir = os.path.dirname(sys.argv[1])
+          missing = [
+              name for name in render_policy.required_video_names(script)
+              if not os.path.exists(os.path.join(build_dir, name))
+          ]
+          if missing:
+              raise SystemExit("missing requested output(s): " + ", ".join(missing))
+          PY
+
+      - name: Build cross-run operational review
+        if: always()
+        run: |
+          python3 pipeline/governor_report.py --repo-root . --json \
+            --output "build/${{ inputs.slug }}/governor-review.json" || true
+
+      - name: Upload Governor diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.slug }}-governor-${{ github.run_id }}
+          if-no-files-found: ignore
+          retention-days: 30
+          path: |
+            build/${{ inputs.slug }}/governor/**
+            build/${{ inputs.slug }}/governor-summary.json
+            build/${{ inputs.slug }}/governor-review.json
+            build/${{ inputs.slug }}/render-status.json
+            build/${{ inputs.slug }}/quality_report.json
+            build/${{ inputs.slug }}/audio-transport-diagnostic.json
+
+      - name: Upload final video
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ inputs.slug }}
+          retention-days: 30
+          path: |
+            build/${{ inputs.slug }}/final*.mp4
+            build/${{ inputs.slug }}/alts_sheet.jpg
+            build/${{ inputs.slug }}/motion_report.json
+            build/${{ inputs.slug }}/motion_report_short.json
+            build/${{ inputs.slug }}/visual_symbol_report.json
+            build/${{ inputs.slug }}/still_reference_report.json
+            build/${{ inputs.slug }}/music_variants.json
+            build/${{ inputs.slug }}/scene-review.html
+            build/${{ inputs.slug }}/scene-review.json
+            build/${{ inputs.slug }}/audio-transport-diagnostic.json
+            build/${{ inputs.slug }}/CREDITS.txt
+
+      - name: Publish permanent release
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="video-${{ inputs.slug }}"
+          gh release view "$tag" >/dev/null 2>&1 || \
+            gh release create "$tag" --title "${{ inputs.slug }}" \
+              --notes "Rendered $(date -u +%F) by run $GITHUB_RUN_ID"
+          shopt -s nullglob
+          files=(
+            build/${{ inputs.slug }}/final*.mp4
+            build/${{ inputs.slug }}/alts_sheet.jpg
+            build/${{ inputs.slug }}/CREDITS.txt
+            build/${{ inputs.slug }}/visual_symbol_report.json
+            build/${{ inputs.slug }}/still_reference_report.json
+            build/${{ inputs.slug }}/music_variants.json
+            build/${{ inputs.slug }}/scene-review.html
+            build/${{ inputs.slug }}/scene-review.json
+            build/${{ inputs.slug }}/audio-transport-diagnostic.json
+          )
+          for file in "${files[@]}"; do
+            test -f "$file" && gh release upload "$tag" "$file" --clobber
+          done
+
+      - name: Persist render outcome
+        if: always()
+        shell: bash
+        run: |
+          rm -f pipeline/.env "build/${{ inputs.slug }}/vo.mp3"
+          printf '%s\n' "$GITHUB_RUN_ID" > "build/${{ inputs.slug }}/run-id.txt"
+          git config user.name "render-bot"
+          git config user.email "render@users.noreply.github.com"
+          for file in \
+            pipeline/memory.json \
+            pipeline/visual_symbols.py \
+            "build/${{ inputs.slug }}/script.json" \
+            "build/${{ inputs.slug }}/run-id.txt" \
+            "build/${{ inputs.slug }}/audio-transport-diagnostic.json" \
+            "build/${{ inputs.slug }}/alts.json" \
+            "build/${{ inputs.slug }}/governor-summary.json" \
+            "build/${{ inputs.slug }}/governor-review.json" \
+            "build/${{ inputs.slug }}/render-status.json" \
+            "build/${{ inputs.slug }}/quality_report.json" \
+            "build/${{ inputs.slug }}/scene-review.json" \
+            "build/${{ inputs.slug }}"/emb_*.npy; do
+            git add "$file" 2>/dev/null || true
+          done
+          git commit -m "render ${{ inputs.slug }}: persist outcome" || echo "nothing to commit"
+          for i in 1 2 3 4 5; do
+            git push && exit 0
+            git stash --include-untracked || true
+            git pull --rebase origin main || git rebase --abort || true
+            git stash pop || true
+            sleep $((i * 2))
+          done
+          echo "unable to push render outcome after 5 attempts" >&2
+          exit 1

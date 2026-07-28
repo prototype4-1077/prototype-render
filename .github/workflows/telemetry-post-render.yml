@@ -1,0 +1,119 @@
+name: Consolidate render telemetry
+
+on:
+  workflow_run:
+    workflows: ["Render video"]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: write
+
+concurrency:
+  group: telemetry-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  consolidate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Resolve Governor artifact and slug
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN: ${{ github.event.workflow_run.id }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          artifact="$(gh api "repos/$REPOSITORY/actions/runs/$SOURCE_RUN/artifacts" --paginate \
+            --jq '.artifacts[] | select(.name | contains("-governor-")) | .name' | head -n 1)"
+          test -n "$artifact"
+          suffix="-governor-$SOURCE_RUN"
+          slug="${artifact%$suffix}"
+          if [ "$slug" = "$artifact" ]; then
+            slug="${artifact%%-governor-*}"
+          fi
+          test -n "$slug"
+          echo "artifact=$artifact" >> "$GITHUB_OUTPUT"
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+          echo "source_run=$SOURCE_RUN" >> "$GITHUB_OUTPUT"
+
+      - name: Download Governor diagnostics
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ARTIFACT: ${{ steps.target.outputs.artifact }}
+          SOURCE_RUN: ${{ steps.target.outputs.source_run }}
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf /tmp/governor-artifact
+          mkdir -p /tmp/governor-artifact "build/$SLUG"
+          gh run download "$SOURCE_RUN" -n "$ARTIFACT" -D /tmp/governor-artifact
+          if [ -d "/tmp/governor-artifact/build/$SLUG" ]; then
+            cp -a "/tmp/governor-artifact/build/$SLUG/." "build/$SLUG/"
+          else
+            cp -a /tmp/governor-artifact/. "build/$SLUG/"
+          fi
+          if [ -d "build/$SLUG/governor/telemetry" ]; then
+            rm -rf "build/$SLUG/telemetry"
+            ln -s "governor/telemetry" "build/$SLUG/telemetry"
+          fi
+          test -s "build/$SLUG/telemetry/spans.jsonl"
+
+      - name: Build compact trace and metric summary
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        run: python3 pipeline/telemetry_report.py "build/$SLUG" --require-spans
+
+      - name: Upload full telemetry package
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.target.outputs.slug }}-telemetry-${{ steps.target.outputs.source_run }}
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            build/${{ steps.target.outputs.slug }}/governor/telemetry/**
+            build/${{ steps.target.outputs.slug }}/telemetry-summary.json
+
+      - name: Attach compact summary to permanent video release
+        if: github.event.workflow_run.conclusion == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="video-$SLUG"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "build/$SLUG/telemetry-summary.json" --clobber
+          fi
+
+      - name: Commit compact telemetry summary
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+          SOURCE_RUN: ${{ steps.target.outputs.source_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$SOURCE_RUN" > "build/$SLUG/telemetry-run-id.txt"
+          git config user.name "telemetry-bot"
+          git config user.email "telemetry@users.noreply.github.com"
+          git add "build/$SLUG/telemetry-summary.json" "build/$SLUG/telemetry-run-id.txt"
+          git commit -m "telemetry $SLUG: persist render trace summary" || exit 0
+          for attempt in 1 2 3 4 5; do
+            git push && exit 0
+            git pull --rebase origin main || git rebase --abort || true
+            sleep $((attempt * 2))
+          done
+          exit 1

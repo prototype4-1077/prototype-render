@@ -1,0 +1,199 @@
+name: WhisperX shadow alignment
+
+on:
+  workflow_run:
+    workflows: ["Build editorial revision cache"]
+    types: [completed]
+  workflow_dispatch:
+    inputs:
+      slug:
+        description: Video slug with an existing revision-cache pointer
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  actions: read
+
+concurrency:
+  group: whisperx-shadow-${{ github.event.workflow_run.id || inputs.slug }}
+  cancel-in-progress: false
+
+jobs:
+  benchmark:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Resolve slug and revision-cache run
+        id: target
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT_NAME: ${{ github.event_name }}
+          SOURCE_RUN: ${{ github.event.workflow_run.id }}
+          INPUT_SLUG: ${{ inputs.slug }}
+          REPOSITORY: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            slug="$INPUT_SLUG"
+            pointer="build/$slug/revision-cache-run-id.txt"
+            test -s "$pointer"
+            cache_run="$(tr -d '[:space:]' < "$pointer")"
+          else
+            cache_run="$SOURCE_RUN"
+            artifact="$(gh api "repos/$REPOSITORY/actions/runs/$cache_run/artifacts" --paginate \
+              --jq '.artifacts[] | select(.name | endswith("-revision-cache")) | .name' | head -n 1)"
+            test -n "$artifact"
+            slug="${artifact%-revision-cache}"
+          fi
+          echo "slug=$slug" >> "$GITHUB_OUTPUT"
+          echo "cache_run=$cache_run" >> "$GITHUB_OUTPUT"
+          echo "resolved $slug from revision cache run $cache_run"
+
+      - name: Download voiceover and current timing evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ steps.target.outputs.slug }}
+          CACHE_RUN: ${{ steps.target.outputs.cache_run }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "build/$SLUG"
+          gh run download "$CACHE_RUN" -n "$SLUG-revision-cache" -D "build/$SLUG"
+          test -s "build/$SLUG/vo.mp3"
+          test -s "build/$SLUG/script.json" || test -s "build/$SLUG/../../build/$SLUG/script.json"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pipeline/requirements-whisperx.txt
+
+      - name: Cache WhisperX models
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/huggingface
+            ~/.cache/torch
+            ~/.cache/whisperx
+          key: whisperx-v3.8.6-base-en-cpu-v1
+
+      - name: Install CPU-only WhisperX environment
+        id: install
+        continue-on-error: true
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu \
+            torch==2.8.0 torchaudio==2.8.0 torchvision==0.23.0
+          python -m pip install -r pipeline/requirements-whisperx.txt
+
+      - name: Run read-only challenger
+        if: steps.install.outcome == 'success'
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+          WHISPERX_MODEL: base.en
+          WHISPERX_DEVICE: cpu
+          WHISPERX_COMPUTE_TYPE: int8
+          WHISPERX_BATCH_SIZE: "4"
+          WHISPERX_LANGUAGE: en
+          WHISPERX_DOWNLOAD_ROOT: ~/.cache/huggingface/whisperx
+        run: python3 pipeline/whisperx_challenger.py "build/$SLUG" --non-blocking
+
+      - name: Record isolated installation failure
+        if: steps.install.outcome != 'success'
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        run: |
+          python3 - <<'PY'
+          import datetime as dt, json, os, pathlib
+          path = pathlib.Path("build") / os.environ["SLUG"] / "alignment-challenger.json"
+          path.write_text(json.dumps({
+              "schema_version": 1,
+              "created_at": dt.datetime.now(dt.timezone.utc).isoformat(),
+              "slug": os.environ["SLUG"],
+              "mode": "shadow_only",
+              "production_timing_written": False,
+              "promotion_automatic": False,
+              "status": "failed",
+              "error_type": "DependencyInstallFailure",
+              "error": "Pinned WhisperX CPU environment did not install on this runner.",
+              "disposition": "reject_run"
+          }, indent=2) + "\n", encoding="utf-8")
+          PY
+
+      - name: Refresh aggregate promotion ledger
+        run: python3 pipeline/whisperx_benchmark_ledger.py .
+
+      - name: Upload challenger evidence
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.target.outputs.slug }}-whisperx-shadow
+          retention-days: 90
+          if-no-files-found: error
+          path: |
+            build/${{ steps.target.outputs.slug }}/alignment-challenger.json
+            build/${{ steps.target.outputs.slug }}/alignment-challenger-words.json
+            pipeline/whisperx-benchmark-ledger.json
+            pipeline/WHISPERX_BENCHMARK.md
+
+      - name: Publish compact summary to permanent video release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="video-$SLUG"
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" "build/$SLUG/alignment-challenger.json" --clobber
+          fi
+
+      - name: Commit summary and benchmark ledger
+        env:
+          SLUG: ${{ steps.target.outputs.slug }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$GITHUB_RUN_ID" > "build/$SLUG/whisperx-shadow-run-id.txt"
+          git config user.name "alignment-benchmark-bot"
+          git config user.email "alignment-benchmark@users.noreply.github.com"
+          git add \
+            "build/$SLUG/alignment-challenger.json" \
+            "build/$SLUG/whisperx-shadow-run-id.txt" \
+            pipeline/whisperx-benchmark-ledger.json \
+            pipeline/WHISPERX_BENCHMARK.md
+          git commit -m "alignment $SLUG: record WhisperX shadow benchmark" || exit 0
+          SNAP="$(mktemp -d)"
+          for file in \
+            "build/$SLUG/alignment-challenger.json" \
+            "build/$SLUG/whisperx-shadow-run-id.txt" \
+            pipeline/whisperx-benchmark-ledger.json \
+            pipeline/WHISPERX_BENCHMARK.md; do
+            mkdir -p "$SNAP/$(dirname "$file")"
+            cp "$file" "$SNAP/$file"
+          done
+          for attempt in 1 2 3 4 5; do
+            git push && exit 0
+            git fetch origin main
+            git reset --hard origin/main
+            (cd "$SNAP" && find . -type f | while read -r file; do
+              mkdir -p "$GITHUB_WORKSPACE/$(dirname "$file")"
+              cp "$file" "$GITHUB_WORKSPACE/$file"
+            done)
+            git add \
+              "build/$SLUG/alignment-challenger.json" \
+              "build/$SLUG/whisperx-shadow-run-id.txt" \
+              pipeline/whisperx-benchmark-ledger.json \
+              pipeline/WHISPERX_BENCHMARK.md
+            git commit -m "alignment $SLUG: record WhisperX shadow benchmark" || exit 0
+            sleep $((attempt * 2))
+          done
+          exit 1

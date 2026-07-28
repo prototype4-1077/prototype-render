@@ -1,0 +1,69 @@
+name: June Oxley profile integrity
+
+on:
+  pull_request:
+    paths:
+      - "concept/characters/june_oxley.json"
+      - "concept/characters/JUNE_OXLEY.md"
+      - "CONCEPT_ENGINE.md"
+      - ".github/workflows/june-oxley-profile-integrity.yml"
+  push:
+    branches: [main]
+    paths:
+      - "concept/characters/june_oxley.json"
+      - "concept/characters/JUNE_OXLEY.md"
+      - "CONCEPT_ENGINE.md"
+      - ".github/workflows/june-oxley-profile-integrity.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Validate canonical profile
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          path = Path('concept/characters/june_oxley.json')
+          profile = json.loads(path.read_text(encoding='utf-8'))
+
+          assert profile['id'] == 'june_oxley'
+          assert profile['display_name'] == 'June Oxley'
+          assert profile['canonical_status'] == 'active'
+          assert profile['voice']['provider'] == 'ElevenLabs'
+          assert profile['voice']['voice_display_name'] == 'Granpa Spuds Oxley'
+          assert profile['voice']['voice_id'] == 'NOpBlnGInO9m6vDvFkFC'
+          assert 'Never silently substitute Liam' in profile['voice']['voice_id_policy']
+          assert 'official public ElevenLabs' in profile['voice']['voice_id_policy']
+          assert profile['ethical_constitution']['politics'].startswith('Oxley has no political identity')
+          assert profile['ethical_constitution']['core_belief'].startswith('You are supposed to do right by people')
+          assert profile['visual_identity']['continuity_rule'].startswith('Use one stable Oxley face')
+          assert 'only into scenes that actually show June' in profile['visual_identity']['continuity_rule']
+          assert profile['visual_identity']['max_human_scene_ratio'] <= 0.45
+          assert profile['script_contract']['scene_target'] == 24
+          assert profile['script_contract']['word_target_min'] == 330
+          assert profile['script_contract']['word_target_max'] == 340
+          assert profile['title_and_caption_system']['series_bug'] == 'JUNE OXLEY'
+          assert 'Do not use a permanent' in profile['title_and_caption_system']['series_bug_treatment']
+          assert len(profile['content_lanes']) >= 5
+          assert Path('concept/characters/JUNE_OXLEY.md').exists()
+
+          engine = Path('CONCEPT_ENGINE.md').read_text(encoding='utf-8')
+          assert 'concept/characters/june_oxley.json' in engine
+          assert 'concept/characters/JUNE_OXLEY.md' in engine
+          assert 'do not silently substitute' in engine.lower()
+
+          forbidden = list(Path('build').glob('*/render.request')) if Path('build').exists() else []
+          assert not forbidden, forbidden
+          print('June Oxley profile is canonical and internally consistent')
+          PY

@@ -1,0 +1,30 @@
+name: Render batch
+on:
+  workflow_dispatch:
+    inputs:
+      slugs:
+        description: "Comma-separated slugs, e.g. video-one,video-two,video-three"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      slugs: ${{ steps.split.outputs.slugs }}
+    steps:
+      - id: split
+        run: |
+          echo "slugs=$(echo '${{ github.event.inputs.slugs }}' | python3 -c 'import json,sys; print(json.dumps([s.strip() for s in sys.stdin.read().split(\",\") if s.strip()]))')" >> "$GITHUB_OUTPUT"
+
+  render:
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix:
+        slug: ${{ fromJSON(needs.plan.outputs.slugs) }}
+    uses: ./.github/workflows/render.yml
+    with:
+      slug: ${{ matrix.slug }}
