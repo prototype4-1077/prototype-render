@@ -1,7 +1,7 @@
 {
   "error": "Configure YT_API_KEY or YT_CLIENT_ID/YT_CLIENT_SECRET/YT_REFRESH_TOKEN",
   "error_type": "RuntimeError",
-  "generated_at": "2026-08-08T14:58:40+00:00",
+  "generated_at": "2026-08-09T15:03:19+00:00",
   "missing_from_api": [],
   "receipt_count": 0,
   "required_action": "Provide YT_API_KEY or refresh the OAuth grant with a YouTube read-capable scope. No statistics were fabricated.",
